@@ -32,6 +32,13 @@ def load_excel(path: str | Path) -> dict[str, pd.DataFrame]:
     df_lim = pd.read_excel(path, sheet_name="Clientes_Limites")
     df_nom = pd.read_excel(path, sheet_name="Nominaciones")
 
+    # Excel puede conservar filas vacías al final de una tabla; no son registros y
+    # pueden causar fallos al convertir campos como anio a entero.
+    df_gen = df_gen.dropna(how="all").reset_index(drop=True)
+    df_cons = df_cons.dropna(how="all").reset_index(drop=True)
+    df_lim = df_lim.dropna(how="all").reset_index(drop=True)
+    df_nom = df_nom.dropna(how="all").reset_index(drop=True)
+
     if "escenario" not in df_gen.columns:
         df_gen["escenario"] = "BASE"
     if "escenario" not in df_cons.columns:
