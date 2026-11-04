@@ -43,3 +43,8 @@ Estos resultados no son óptimos validados. No se ejecutó PuLP: no estaba insta
 ## 2026-11-04 — Corrección de importación al arrancar
 
 Se actualizó `app/app.py` para agregar la raíz del proyecto (`tesis-mater/`) a `sys.path` a partir de la ubicación del propio archivo. Esto corrige `ModuleNotFoundError: No module named 'src'` al lanzar Streamlit. Verificación: inspección del recorrido de rutas; aún pendiente confirmación de ejecución en el Windows del usuario. No cambia cálculos ni resultados.
+
+
+## 2026-11-04 — Limpieza de filas vacías en la carga Excel
+
+El cargador ahora elimina registros completamente vacíos de las cuatro hojas leídas y reinicia sus índices. Esto corrige `IntCastingNaNError` al convertir `Nominaciones.anio` y evita que filas vacías lleguen al simulador. Las filas con algún dato se conservan. Validación: cambio revisado; ejecución en el Windows del usuario pendiente. No altera los datos comerciales válidos.
