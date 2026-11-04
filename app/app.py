@@ -49,8 +49,8 @@ def _kpis(results: dict[str, pd.DataFrame]) -> dict[str, float]:
     rm = results["resumen_mensual"].copy()
     k = {
         "Margen anual (USD)": float(rm["margen_usd"].sum()),
-        "Energía asignada anual (MWh)": float(rm["asignado_MWh"].sum()),
-        "Energía no abastecida anual (MWh)": float(rm["no_abastecido_MWh"].sum()),
+        "Energía asignada anual (MWh)": float(rm["energia_asignada_mwh"].sum()),
+        "Energía no abastecida anual (MWh)": float(results["no_abastecido"]["no_abastecido_mwh"].sum()),
     }
     return k
 
