@@ -38,3 +38,8 @@ Estos resultados no son óptimos validados. No se ejecutó PuLP: no estaba insta
 3. Precisar prioridades, TOP y contratos a partir de tesis y datos.
 4. Optimización y contraste contra simulación; distinguir óptimo probado de solución factible.
 5. Importación de datos e interfaz; documentación de defensa.
+
+
+## 2026-11-04 — Corrección de importación al arrancar
+
+Se actualizó `app/app.py` para agregar la raíz del proyecto (`tesis-mater/`) a `sys.path` a partir de la ubicación del propio archivo. Esto corrige `ModuleNotFoundError: No module named 'src'` al lanzar Streamlit. Verificación: inspección del recorrido de rutas; aún pendiente confirmación de ejecución en el Windows del usuario. No cambia cálculos ni resultados.
