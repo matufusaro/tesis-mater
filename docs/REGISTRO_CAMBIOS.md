@@ -48,3 +48,8 @@ Se actualizó `app/app.py` para agregar la raíz del proyecto (`tesis-mater/`) a
 ## 2026-11-04 — Limpieza de filas vacías en la carga Excel
 
 El cargador ahora elimina registros completamente vacíos de las cuatro hojas leídas y reinicia sus índices. Esto corrige `IntCastingNaNError` al convertir `Nominaciones.anio` y evita que filas vacías lleguen al simulador. Las filas con algún dato se conservan. Validación: cambio revisado; ejecución en el Windows del usuario pendiente. No altera los datos comerciales válidos.
+
+
+## 2026-11-04 — Alinear indicadores con resultados del simulador
+
+La app ahora calcula energía asignada desde `resumen_mensual.energia_asignada_mwh` y energía no abastecida desde `no_abastecido.no_abastecido_mwh`, nombres realmente devueltos por el simulador. El KeyError ocurría después de cargar datos y correr la simulación; no era un fallo de lectura de las bases. Verificación: contraste con las columnas de salida de `simulate_cammesa`; confirmación de ejecución en Windows pendiente.
