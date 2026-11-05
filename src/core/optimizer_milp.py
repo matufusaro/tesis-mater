@@ -1,24 +1,9 @@
 from __future__ import annotations
 
-"""Optimizador MILP (demo).
-
-Esta implementación está pensada para la **app de demostración** y para la tesis:
-no intenta reproducir todas las sutilezas contractuales, sino proveer un
-esqueleto coherente para:
-
-1) Elegir nominaciones (energía nominal) por acuerdo y por mes.
-2) Respetar límites de generación (oferta) y consumo (demanda).
-3) Cumplir mínimos/máximos anuales por cliente (tabla Clientes_Limites).
-4) Introducir una decisión discreta (variable binaria) para "activar" acuerdos
-   de menor preferencia (p.ej. prioridad_asignacion=2), mostrando por qué una
-   MILP aporta expresividad respecto de una PL continua.
-
-La función pública principal es :func:`solve_milp_nominal`.
-"""
-
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 
+import numpy as np
 import pandas as pd
 
 
@@ -34,172 +19,216 @@ def solve_milp_nominal(
     df_gen: pd.DataFrame,
     df_cons: pd.DataFrame,
     df_lim: pd.DataFrame,
-    df_nom_template: pd.DataFrame,
+    df_nom_template: pd.DataFrame,  # NO se usa (compatibilidad con app)
     anio: int,
     gen_scenario: str | None = None,
     cons_scenario: str | None = None,
-    min_block_mwh_p2: float = 50.0,
-    fixed_penalty_p2_usd: float = 100.0,
+    min_block_mwh_p2: float = 0.0,     # no se usa
+    fixed_penalty_p2_usd: float = 0.0, # no se usa
     solver_time_limit_s: int = 30,
 ) -> MilpSolution:
-    """Resuelve una MILP para proponer nominaciones mensuales.
-
-    Parameters
-    ----------
-    df_gen, df_cons, df_lim, df_nom_template:
-        DataFrames cargados desde Excel.
-    anio:
-        Año a optimizar.
-    gen_scenario, cons_scenario:
-        Si existen columnas 'escenario' en generación/consumo, filtra por el
-        escenario elegido.
-    min_block_mwh_p2:
-        Mínimo de energía si se "activa" un acuerdo con prioridad_asignacion >= 2.
-        Se implementa con una binaria (x >= min_block * y).
-    fixed_penalty_p2_usd:
-        Penalización fija por activar acuerdos de prioridad 2 (para desalentar su
-        uso salvo necesidad).
-    solver_time_limit_s:
-        Límite de tiempo del solver.
     """
+    Optimizador "desde cero":
+    - Crea asignaciones x[c,g,m] usando SOLO generación + consumo + límites + precio de venta del cliente.
+    - Construye df_nom_opt (nominaciones) desde cero.
 
-    # Import local para que la app pueda correr aunque el usuario todavía no
-    # haya instalado PuLP (se informa el error en UI).
+    Requisitos de datos:
+    - df_cons debe incluir columna: precio_venta_usd_mwh (por cliente-mes o constante repetida).
+    - df_gen debe incluir: energia_disponible_mwh, precio_compra_usd_mwh, take_or_pay_ratio, penalidad_no_tomado_usd_mwh
+      (TOP anual por generador, ratio y penalidad constantes).
+    - df_lim: min_anual_mwh y max_anual_mwh por cliente (si falta, se asume 0 / +inf).
+    """
     import pulp  # type: ignore
 
-    # --------------- Filtrado base ---------------
-    df_gen_y = df_gen[df_gen["anio"].astype(int) == int(anio)].copy()
-    df_cons_y = df_cons[df_cons["anio"].astype(int) == int(anio)].copy()
-    df_nom_y = df_nom_template[df_nom_template["anio"].astype(int) == int(anio)].copy()
+    # ---------- filtrar año/escenario ----------
+    g = df_gen.copy()
+    c = df_cons.copy()
+    lim = df_lim.copy()
 
-    # Vigencia
-    df_nom_y = df_nom_y[
-        (df_nom_y["mes"].astype(int) >= df_nom_y["mes_inicio"].astype(int))
-        & (df_nom_y["mes"].astype(int) <= df_nom_y["mes_fin"].astype(int))
-    ].copy()
+    if "anio" in g.columns:
+        g = g[pd.to_numeric(g["anio"], errors="coerce").fillna(-1).astype(int) == int(anio)].copy()
+    if "anio" in c.columns:
+        c = c[pd.to_numeric(c["anio"], errors="coerce").fillna(-1).astype(int) == int(anio)].copy()
+    if "anio" in lim.columns:
+        lim = lim[pd.to_numeric(lim["anio"], errors="coerce").fillna(int(anio)).astype(int) == int(anio)].copy()
 
-    if gen_scenario is not None and "escenario" in df_gen_y.columns:
-        df_gen_y = df_gen_y[df_gen_y["escenario"].astype(str) == str(gen_scenario)].copy()
-    if cons_scenario is not None and "escenario" in df_cons_y.columns:
-        df_cons_y = df_cons_y[df_cons_y["escenario"].astype(str) == str(cons_scenario)].copy()
+    if gen_scenario is not None and "escenario" in g.columns:
+        g = g[g["escenario"].astype(str) == str(gen_scenario)].copy()
+    if cons_scenario is not None and "escenario" in c.columns:
+        c = c[c["escenario"].astype(str) == str(cons_scenario)].copy()
 
-    # Mapas rápidos
-    gen_av = {
-        (int(r.anio), int(r.mes), str(r.nemo_generador)): float(r.energia_disponible_mwh)
-        for r in df_gen_y.itertuples(index=False)
-    }
-    gen_price = {
-        (int(r.anio), int(r.mes), str(r.nemo_generador)): float(r.precio_compra_usd_mwh)
-        for r in df_gen_y.itertuples(index=False)
-    }
-    cons = {
-        (int(r.anio), int(r.mes), str(r.nemo_cliente)): float(r.consumo_mwh)
-        for r in df_cons_y.itertuples(index=False)
-    }
+    # ---------- validar columnas ----------
+    required_gen = ["mes", "nemo_generador", "energia_disponible_mwh", "precio_compra_usd_mwh"]
+    for col in required_gen:
+        if col not in g.columns:
+            raise KeyError(f"df_gen: falta columna '{col}'")
 
-    # --------------- Modelo ---------------
-    model = pulp.LpProblem("Nominal_MILP", pulp.LpMaximize)
+    required_cons = ["mes", "nemo_cliente", "consumo_mwh", "precio_venta_usd_mwh"]
+    for col in required_cons:
+        if col not in c.columns:
+            raise KeyError(f"df_cons: falta columna '{col}' (agregala al Excel)")
 
-    x: Dict[int, pulp.LpVariable] = {}
-    y: Dict[int, pulp.LpVariable] = {}
+    # TOP (si no están, default 0)
+    if "take_or_pay_ratio" not in g.columns:
+        g["take_or_pay_ratio"] = 0.0
+    if "penalidad_no_tomado_usd_mwh" not in g.columns:
+        g["penalidad_no_tomado_usd_mwh"] = 0.0
 
-    # Precalcular filas válidas (tienen oferta y demanda definidas)
-    df_nom_y = df_nom_y.reset_index(drop=True)
-    valid_rows = []
-    for i, r in df_nom_y.iterrows():
-        key_g = (int(r["anio"]), int(r["mes"]), str(r["nemo_generador"]))
-        key_c = (int(r["anio"]), int(r["mes"]), str(r["nemo_cliente"]))
-        if key_g not in gen_av or key_c not in cons:
-            continue
-        valid_rows.append(i)
+    # ---------- normalizar numéricos ----------
+    g["mes"] = pd.to_numeric(g["mes"], errors="coerce").astype(int)
+    g["energia_disponible_mwh"] = pd.to_numeric(g["energia_disponible_mwh"], errors="coerce").fillna(0.0)
+    g["precio_compra_usd_mwh"] = pd.to_numeric(g["precio_compra_usd_mwh"], errors="coerce").fillna(0.0)
+    g["take_or_pay_ratio"] = pd.to_numeric(g["take_or_pay_ratio"], errors="coerce").fillna(0.0)
+    g["penalidad_no_tomado_usd_mwh"] = pd.to_numeric(g["penalidad_no_tomado_usd_mwh"], errors="coerce").fillna(0.0)
 
-    if not valid_rows:
-        return MilpSolution(status="NoData", objective_usd=0.0, df_nom_opt=df_nom_y, df_vars=pd.DataFrame())
+    c["mes"] = pd.to_numeric(c["mes"], errors="coerce").astype(int)
+    c["consumo_mwh"] = pd.to_numeric(c["consumo_mwh"], errors="coerce").fillna(0.0)
+    c["precio_venta_usd_mwh"] = pd.to_numeric(c["precio_venta_usd_mwh"], errors="coerce")
 
-    # Variables y objetivo
-    obj_terms = []
-    for i in valid_rows:
-        r = df_nom_y.loc[i]
-        key_g = (int(r["anio"]), int(r["mes"]), str(r["nemo_generador"]))
-        buy = float(gen_price[key_g])
-        sell = float(r["precio_venta_usd_mwh"])
-        margin = sell - buy
+    # si hay duplicados cliente-mes, los sumamos (consumo) y promediamos PV
+    c = (
+        c.groupby(["nemo_cliente", "mes"], as_index=False)
+        .agg(consumo_mwh=("consumo_mwh", "sum"), precio_venta_usd_mwh=("precio_venta_usd_mwh", "mean"))
+    )
 
-        # Cota superior por fila (acotamos por demanda mensual del cliente)
-        key_c = (int(r["anio"]), int(r["mes"]), str(r["nemo_cliente"]))
-        ub = float(cons[key_c])
+    # generación: agrupar generador-mes
+    g = (
+        g.groupby(["nemo_generador", "mes"], as_index=False)
+        .agg(
+            energia_disponible_mwh=("energia_disponible_mwh", "sum"),
+            precio_compra_usd_mwh=("precio_compra_usd_mwh", "mean"),
+            take_or_pay_ratio=("take_or_pay_ratio", "max"),
+            penalidad_no_tomado_usd_mwh=("penalidad_no_tomado_usd_mwh", "max"),
+        )
+    )
 
-        x[i] = pulp.LpVariable(f"x_{i}", lowBound=0, upBound=ub, cat=pulp.LpContinuous)
-        y[i] = pulp.LpVariable(f"y_{i}", lowBound=0, upBound=1, cat=pulp.LpBinary)
+    # límites cliente
+    if "min_anual_mwh" not in lim.columns:
+        lim["min_anual_mwh"] = 0.0
+    if "max_anual_mwh" not in lim.columns:
+        lim["max_anual_mwh"] = np.inf
+    lim["min_anual_mwh"] = pd.to_numeric(lim["min_anual_mwh"], errors="coerce").fillna(0.0)
+    lim["max_anual_mwh"] = pd.to_numeric(lim["max_anual_mwh"], errors="coerce")
+    lim["max_anual_mwh"] = lim["max_anual_mwh"].where(lim["max_anual_mwh"].notna(), np.inf)
 
-        # Activación: si se usa el acuerdo, x puede ser > 0; si no, x debe ser 0
-        model += x[i] <= ub * y[i], f"link_up_{i}"
+    # ---------- sets ----------
+    months: List[int] = sorted(c["mes"].unique().tolist()) or list(range(1, 13))
+    clients: List[str] = sorted(c["nemo_cliente"].astype(str).unique().tolist())
+    gens: List[str] = sorted(g["nemo_generador"].astype(str).unique().tolist())
 
-        # Para acuerdos de prioridad 2+, imponemos un mínimo por activación
-        pr = int(r["prioridad_asignacion"])
-        if pr >= 2:
-            model += x[i] >= float(min_block_mwh_p2) * y[i], f"min_block_p2_{i}"
-            obj_terms.append(-float(fixed_penalty_p2_usd) * y[i])
+    if not clients or not gens:
+        return MilpSolution(status="NoData", objective_usd=0.0, df_nom_opt=pd.DataFrame(), df_vars=pd.DataFrame())
 
-        obj_terms.append(float(margin) * x[i])
+    # mapas
+    cons = {(str(r.nemo_cliente), int(r.mes)): float(r.consumo_mwh) for r in c.itertuples(index=False)}
+    sell = {(str(r.nemo_cliente), int(r.mes)): float(r.precio_venta_usd_mwh) for r in c.itertuples(index=False)}
 
-    model += pulp.lpSum(obj_terms)
+    avail = {(str(r.nemo_generador), int(r.mes)): float(r.energia_disponible_mwh) for r in g.itertuples(index=False)}
+    buy = {(str(r.nemo_generador), int(r.mes)): float(r.precio_compra_usd_mwh) for r in g.itertuples(index=False)}
 
-    # --------------- Restricciones ---------------
-    # Oferta por generador-mes
-    for (yy, mm, g), av in gen_av.items():
-        # restringir solo si ese (g,m) aparece en filas válidas
-        idx = [i for i in valid_rows if (int(df_nom_y.loc[i, "anio"]), int(df_nom_y.loc[i, "mes"]), str(df_nom_y.loc[i, "nemo_generador"])) == (yy, mm, g)]
-        if not idx:
-            continue
-        model += pulp.lpSum([x[i] for i in idx]) <= float(av), f"supply_{g}_{yy}_{mm}"
+    # TOP anual por generador (ratio y penalidad constantes)
+    top_year = (
+        g.groupby("nemo_generador", as_index=False)
+        .agg(
+            disponible_anual=("energia_disponible_mwh", "sum"),
+            ratio=("take_or_pay_ratio", "max"),
+            pen=("penalidad_no_tomado_usd_mwh", "max"),
+        )
+    )
+    top_req = {str(r.nemo_generador): float(r.ratio) * float(r.disponible_anual) for r in top_year.itertuples(index=False)}
+    top_pen = {str(r.nemo_generador): float(r.pen) for r in top_year.itertuples(index=False)}
 
-    # Demanda por cliente-mes (no asignar más que el consumo real)
-    # (podría ser redundante por la cota superior y por sumatoria, pero la dejamos explícita)
-    for (yy, mm, c), d in cons.items():
-        idx = [i for i in valid_rows if (int(df_nom_y.loc[i, "anio"]), int(df_nom_y.loc[i, "mes"]), str(df_nom_y.loc[i, "nemo_cliente"])) == (yy, mm, c)]
-        if not idx:
-            continue
-        model += pulp.lpSum([x[i] for i in idx]) <= float(d), f"demand_{c}_{yy}_{mm}"
+    min_year = {str(r.nemo_cliente): float(r.min_anual_mwh) for r in lim.itertuples(index=False)} if "nemo_cliente" in lim.columns else {}
+    max_year = {str(r.nemo_cliente): float(r.max_anual_mwh) for r in lim.itertuples(index=False)} if "nemo_cliente" in lim.columns else {}
+    for cl in clients:
+        min_year.setdefault(cl, 0.0)
+        max_year.setdefault(cl, float("inf"))
 
-    # Mínimos/máximos anuales por cliente
-    for r in df_lim.itertuples(index=False):
-        c = str(r.nemo_cliente)
-        min_a = float(r.min_anual_mwh)
-        max_a = float(r.max_anual_mwh)
-        idx = [i for i in valid_rows if str(df_nom_y.loc[i, "nemo_cliente"]) == c]
-        if not idx:
-            continue
-        model += pulp.lpSum([x[i] for i in idx]) >= min_a, f"min_year_{c}"
-        model += pulp.lpSum([x[i] for i in idx]) <= max_a, f"max_year_{c}"
+    # ---------- modelo ----------
+    model = pulp.LpProblem("OPT_DESDE_CERO", pulp.LpMaximize)
 
-    # --------------- Resolver ---------------
+    x: Dict[Tuple[str, str, int], pulp.LpVariable] = {}
+    short: Dict[str, pulp.LpVariable] = {}
+
+    # variables x[c,g,m]
+    for cl in clients:
+        for ge in gens:
+            for m in months:
+                ub = min(cons.get((cl, m), 0.0), avail.get((ge, m), 0.0))
+                x[(cl, ge, m)] = pulp.LpVariable(f"x_{cl}_{ge}_{m}", lowBound=0, upBound=float(ub), cat=pulp.LpContinuous)
+
+    # shortfall anual por generador
+    for ge in gens:
+        short[ge] = pulp.LpVariable(f"short_{ge}", lowBound=0, cat=pulp.LpContinuous)
+
+    # objetivo: margen - penalidad TOP anual
+    obj = []
+    for cl in clients:
+        for ge in gens:
+            for m in months:
+                pv = sell.get((cl, m), 0.0)
+                pc = buy.get((ge, m), 0.0)
+                obj.append((pv - pc) * x[(cl, ge, m)])
+
+    for ge in gens:
+        obj.append(-top_pen.get(ge, 0.0) * short[ge])
+
+    model += pulp.lpSum(obj)
+
+    # restricciones demanda cliente-mes
+    for cl in clients:
+        for m in months:
+            model += pulp.lpSum([x[(cl, ge, m)] for ge in gens]) <= float(cons.get((cl, m), 0.0)), f"demand_{cl}_{m}"
+
+    # restricciones oferta generador-mes
+    for ge in gens:
+        for m in months:
+            model += pulp.lpSum([x[(cl, ge, m)] for cl in clients]) <= float(avail.get((ge, m), 0.0)), f"supply_{ge}_{m}"
+
+    # mínimos/máximos anuales cliente
+    for cl in clients:
+        tot = pulp.lpSum([x[(cl, ge, m)] for ge in gens for m in months])
+        model += tot >= float(min_year.get(cl, 0.0)), f"min_year_{cl}"
+        mx = float(max_year.get(cl, float("inf")))
+        if np.isfinite(mx):
+            model += tot <= mx, f"max_year_{cl}"
+
+    # TOP anual generador (short >= requerido - tomado)
+    for ge in gens:
+        taken = pulp.lpSum([x[(cl, ge, m)] for cl in clients for m in months])
+        model += short[ge] >= float(top_req.get(ge, 0.0)) - taken, f"top_{ge}"
+
+    # resolver
     solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=int(solver_time_limit_s))
     model.solve(solver)
 
     status = pulp.LpStatus.get(model.status, str(model.status))
-    obj = float(pulp.value(model.objective) or 0.0)
+    objective = float(pulp.value(model.objective) or 0.0)
 
-    # --------------- Salidas ---------------
-    df_vars = []
-    for i in valid_rows:
-        df_vars.append(
-            {
-                "row": i,
-                "id_acuerdo": df_nom_y.loc[i, "id_acuerdo"],
-                "anio": int(df_nom_y.loc[i, "anio"]),
-                "mes": int(df_nom_y.loc[i, "mes"]),
-                "nemo_cliente": str(df_nom_y.loc[i, "nemo_cliente"]),
-                "nemo_generador": str(df_nom_y.loc[i, "nemo_generador"]),
-                "prioridad_asignacion": int(df_nom_y.loc[i, "prioridad_asignacion"]),
-                "x_opt_mwh": float(x[i].value() or 0.0),
-                "y_activo": int(round(float(y[i].value() or 0.0))),
-            }
+    # salida df_vars
+    rows = []
+    for (cl, ge, m), var in x.items():
+        val = float(var.value() or 0.0)
+        if val > 1e-9:
+            rows.append({"anio": int(anio), "mes": int(m), "nemo_cliente": cl, "nemo_generador": ge, "x_opt_mwh": val})
+    df_vars = pd.DataFrame(rows)
+
+    # construir df_nom_opt desde cero (formato compatible)
+    if df_vars.empty:
+        df_nom_opt = pd.DataFrame(
+            columns=["id_acuerdo", "anio", "mes", "nemo_cliente", "nemo_generador", "prioridad_asignacion",
+                     "precio_venta_usd_mwh", "nominal_mwh", "mes_inicio", "mes_fin"]
         )
-    df_vars = pd.DataFrame(df_vars)
+    else:
+        df_nom_opt = df_vars.rename(columns={"x_opt_mwh": "nominal_mwh"}).copy()
+        df_nom_opt["id_acuerdo"] = "AUTO_" + df_nom_opt["nemo_cliente"].astype(str) + "_" + df_nom_opt["nemo_generador"].astype(str)
+        df_nom_opt["prioridad_asignacion"] = 1
+        df_nom_opt["precio_venta_usd_mwh"] = df_nom_opt.apply(lambda r: sell.get((str(r["nemo_cliente"]), int(r["mes"])), 0.0), axis=1)
+        df_nom_opt["mes_inicio"] = 1
+        df_nom_opt["mes_fin"] = 12
+        df_nom_opt = df_nom_opt[
+            ["id_acuerdo", "anio", "mes", "nemo_cliente", "nemo_generador", "prioridad_asignacion",
+             "precio_venta_usd_mwh", "nominal_mwh", "mes_inicio", "mes_fin"]
+        ].copy()
 
-    df_nom_opt = df_nom_y.copy()
-    if not df_vars.empty:
-        df_nom_opt.loc[df_vars["row"].values, "nominal_mwh"] = df_vars["x_opt_mwh"].values
-
-    return MilpSolution(status=status, objective_usd=obj, df_nom_opt=df_nom_opt, df_vars=df_vars)
+    return MilpSolution(status=status, objective_usd=objective, df_nom_opt=df_nom_opt, df_vars=df_vars)
