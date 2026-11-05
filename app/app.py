@@ -20,6 +20,13 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from src.core.cammesa_simulator import simulate_cammesa
 from src.core.optimizer_milp import solve_milp_nominal
 from src.io.exporter import results_to_excel_bytes
@@ -28,7 +35,7 @@ from src.io.overrides import apply_nominal_overrides
 
 
 st.set_page_config(page_title="Asignación de Energía - Demo", layout="wide")
-DATA_FILE_DEFAULT = "data/BD_Ejemplo_2026_escenarios.xlsx"
+DATA_FILE_DEFAULT = "data/BD_Ejemplo_2025.xlsx"
 
 
 # -------------------- Helpers básicos --------------------
