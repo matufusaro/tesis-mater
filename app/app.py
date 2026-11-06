@@ -1,20 +1,5 @@
 from __future__ import annotations
 
-"""
-App Streamlit - Asignación de energía (demo)
-
-Pestañas:
-  1) Simulador Baseline
-  2) Optimizador MILP
-  3) Comparativa + Resumen + (3 gráficos)
-
-Cambios principales (respecto a tu versión):
-- Se agrega economía anual explícita (Ingreso, Costo, Margen Bruto, Penalidad TOP anual, Margen Neto).
-- KPIs pasan a mostrar Margen NETO anual + Penalidad TOP anual.
-- Comparativa incorpora tabla de economía anual Baseline vs Optimizado.
-- Exportación Excel incluye la hoja de economía anual.
-"""
-
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -382,8 +367,6 @@ def _summary_text(
 
 # -------------------- App --------------------
 def main() -> None:
-    st.title("Asignación de energía renovable – Simulador y Optimizador (Demo)")
-
     with st.sidebar:
         st.header("Datos")
         data_file = st.text_input("Archivo Excel de datos", value=DATA_FILE_DEFAULT)
@@ -417,36 +400,45 @@ def main() -> None:
 
     # -------------------- TAB 1: Baseline --------------------
     with tab1:
-        st.subheader("Simulador Baseline")
+        st.title("MODELO DE SIMULACIÓN (CAMMESA)")
 
-        df_nom_y = df_nom_base[_safe_int_series(df_nom_base["anio"]) == int(anio)].copy()
+        st.subheader("Generadores")
+        st.caption("Datos mensuales de disponibilidad, precio y compromisos TOP cargados desde el archivo Excel.")
+
+        st.subheader("Clientes")
+        st.caption("Consumos mensuales y límites anuales cargados desde el archivo Excel.")
+
+        st.subheader("Ejecutar simulación")
+
+        df_nom_y = _filter_year_scenario(df_nom_base, int(anio), None)
+        df_nom_y = df_nom_y.copy()
         df_nom_y = df_nom_y.sort_values(["nemo_cliente", "prioridad_asignacion", "nemo_generador", "mes"]).reset_index(drop=True)
-
-        st.markdown("**Edición de nominaciones mensuales (nominal_mwh)**")
-        edited = st.data_editor(
-            df_nom_y,
-            use_container_width=True,
-            disabled=[c for c in df_nom_y.columns if c not in ["nominal_mwh"]],
-            hide_index=True,
-        )
 
         run = st.button("Ejecutar simulación baseline", type="primary")
         if run:
-            df_nom_use = apply_nominal_overrides(df_nom_base, edited)
-            df_gen_y = _filter_year_scenario(df_gen, int(anio), gen_scen)
-            df_cons_y = _filter_year_scenario(df_cons, int(anio), cons_scen)
+            try:
+                edited_nom = st.session_state.get("baseline_nominal_edited_df", df_nom_y)
+                if not isinstance(edited_nom, pd.DataFrame):
+                    raise TypeError("La edición de nominaciones debe devolver un DataFrame de pandas.")
+                df_nom_use = apply_nominal_overrides(df_nom_base, edited_nom)
+                df_gen_y = _filter_year_scenario(df_gen, int(anio), gen_scen)
+                df_cons_y = _filter_year_scenario(df_cons, int(anio), cons_scen)
 
-            results = simulate_cammesa(df_gen_y, df_cons_y, df_lim, df_nom_use, anio=int(anio))
-            st.session_state["baseline_results"] = results
-            st.session_state["baseline_meta"] = {"anio": int(anio), "gen": gen_scen, "cons": cons_scen}
-            st.session_state["baseline_gen_y"] = df_gen_y
-            st.session_state["baseline_cons_y"] = df_cons_y
+                results = simulate_cammesa(df_gen_y, df_cons_y, df_lim, df_nom_use, anio=int(anio))
+                st.session_state["baseline_results"] = results
+                st.session_state["baseline_meta"] = {"anio": int(anio), "gen": gen_scen, "cons": cons_scen}
+                st.session_state["baseline_gen_y"] = df_gen_y
+                st.session_state["baseline_cons_y"] = df_cons_y
+            except Exception as e:
+                st.error(f"Error crítico durante la simulación: {e}")
+                st.stop()
 
         if "baseline_results" in st.session_state:
             results = st.session_state["baseline_results"]
             df_gen_y = st.session_state["baseline_gen_y"]
             df_cons_y = st.session_state["baseline_cons_y"]
 
+            st.subheader("Resultados de simulación")
             k = _kpis(results)
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Margen neto anual (USD)", f"{k['Margen neto anual (USD)']:,.0f}")
@@ -455,35 +447,9 @@ def main() -> None:
             c4.metric("Energía no abastecida anual (MWh)", f"{k['Energía no abastecida anual (MWh)']:,.0f}")
 
             st.divider()
-            st.markdown("### Economía anual (Baseline)")
-            econ_b = _annual_economics(results)
-            df_econ_b = pd.DataFrame([econ_b]).T.reset_index()
-            df_econ_b.columns = ["Concepto", "USD"]
-            st.dataframe(df_econ_b, use_container_width=True, hide_index=True)
+            st.subheader("Visualizaciones")
+            st.caption("No hay visualizaciones específicas en esta etapa del Simulador Baseline.")
 
-            st.divider()
-            st.markdown("### Resultados (Baseline)")
-            st.markdown("**Resumen mensual**")
-            st.dataframe(results["resumen_mensual"], use_container_width=True, hide_index=True)
-
-            st.markdown("**Compras por generador (PG1/PG2 internas)**")
-            st.dataframe(results["por_generador_prioridad"], use_container_width=True, hide_index=True)
-
-            st.markdown("**Detalle de transacciones**")
-            st.dataframe(results["detalle"], use_container_width=True, hide_index=True)
-
-            st.divider()
-            st.markdown("### Mínimo / Máximo anual por cliente (Baseline)")
-            df_limits_b = _client_minmax_table(df_lim, results, int(anio))
-            st.dataframe(df_limits_b, use_container_width=True, hide_index=True)
-
-            st.divider()
-            st.markdown("### Generadores: disponible vs tomado (Baseline)")
-            df_gen_take_b = _gen_avail_vs_taken_table(df_gen_y, results)
-            st.dataframe(df_gen_take_b, use_container_width=True, hide_index=True)
-
-            st.divider()
-            st.markdown("### Validación: asignación > consumo (Baseline)")
             cons_cm = _consumption_by_client_month(df_cons_y)
             alloc_cm = _alloc_by_client_month(results)
             df_over_b = _client_month_overassign(cons_cm, alloc_cm)
@@ -491,10 +457,15 @@ def main() -> None:
                 st.success("OK: no se detectaron casos de asignación mayor al consumo.")
             else:
                 st.error(f"Se detectaron {len(df_over_b)} filas cliente-mes con asignación > consumo.")
-                st.dataframe(df_over_b, use_container_width=True, hide_index=True)
 
             st.divider()
-            st.markdown("### Exportación (Baseline)")
+            st.subheader("Exportación Excel")
+            econ_b = _annual_economics(results)
+            df_econ_b = pd.DataFrame([econ_b]).T.reset_index()
+            df_econ_b.columns = ["Concepto", "USD"]
+            df_limits_b = _client_minmax_table(df_lim, results, int(anio))
+            df_gen_take_b = _gen_avail_vs_taken_table(df_gen_y, results)
+
             xlsx_all_b = _dfs_to_excel_bytes(
                 {
                     "economia_anual": df_econ_b,
@@ -512,13 +483,52 @@ def main() -> None:
                 file_name=f"baseline_todo_{anio}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-
             st.download_button(
                 "Descargar resultados Baseline (Excel - formato estándar)",
                 data=results_to_excel_bytes(results),
                 file_name=f"resultados_baseline_{anio}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+
+            st.divider()
+            st.subheader("Detalle técnico y auditoría")
+
+            with st.expander("Economía anual", expanded=False):
+                st.dataframe(df_econ_b, use_container_width=True, hide_index=True)
+
+            with st.expander("Resumen mensual y compras por generador", expanded=False):
+                st.markdown("**Resumen mensual**")
+                st.dataframe(results["resumen_mensual"], use_container_width=True, hide_index=True)
+                st.markdown("**Compras por generador (PG1/PG2 internas)**")
+                st.dataframe(results["por_generador_prioridad"], use_container_width=True, hide_index=True)
+
+            with st.expander("Detalle de transacciones", expanded=False):
+                st.dataframe(results["detalle"], use_container_width=True, hide_index=True)
+
+            with st.expander("Mínimo / máximo anual por cliente", expanded=False):
+                st.dataframe(df_limits_b, use_container_width=True, hide_index=True)
+
+            with st.expander("Generadores: disponible vs tomado", expanded=False):
+                st.dataframe(df_gen_take_b, use_container_width=True, hide_index=True)
+
+            with st.expander("Validación: asignación mayor al consumo", expanded=False):
+                if df_over_b.empty:
+                    st.success("OK: no se detectaron casos de asignación mayor al consumo.")
+                else:
+                    st.dataframe(df_over_b, use_container_width=True, hide_index=True)
+
+            st.caption("Las tablas técnicas conservan las fórmulas, periodizaciones y resultados originales del simulador.", help=None)
+
+        st.divider()
+        st.subheader("Edición de nominaciones mensuales")
+        st.markdown("**`nominal_mwh` — nominaciones mensuales**")
+        edited = st.data_editor(
+            df_nom_y,
+            use_container_width=True,
+            disabled=[c for c in df_nom_y.columns if c not in ["nominal_mwh"]],
+            hide_index=True,
+        )
+        st.session_state["baseline_nominal_edited_df"] = edited
 
     # -------------------- TAB 2: Optimización MILP --------------------
     with tab2:
@@ -725,7 +735,6 @@ def main() -> None:
         cons_cm = _consumption_by_client_month(df_cons_b)
         alloc_b = _alloc_by_client_month(b).rename(columns={"asignado_mwh": "asignado_baseline_mwh"})
         alloc_o = _alloc_by_client_month(o).rename(columns={"asignado_mwh": "asignado_opt_mwh"})
-
         df_clients = cons_cm.merge(alloc_b, on=["nemo_cliente", "mes"], how="left").merge(alloc_o, on=["nemo_cliente", "mes"], how="left")
         df_clients["asignado_baseline_mwh"] = df_clients["asignado_baseline_mwh"].fillna(0.0)
         df_clients["asignado_opt_mwh"] = df_clients["asignado_opt_mwh"].fillna(0.0)
@@ -735,7 +744,6 @@ def main() -> None:
         av_gm = _available_by_gen_month(df_gen_b)
         taken_b = _alloc_by_gen_month(b).rename(columns={"tomado_mwh": "tomado_baseline_mwh"})
         taken_o = _alloc_by_gen_month(o).rename(columns={"tomado_mwh": "tomado_opt_mwh"})
-
         df_gens = av_gm.merge(taken_b, on=["nemo_generador", "mes"], how="left").merge(taken_o, on=["nemo_generador", "mes"], how="left")
         df_gens["tomado_baseline_mwh"] = df_gens["tomado_baseline_mwh"].fillna(0.0)
         df_gens["tomado_opt_mwh"] = df_gens["tomado_opt_mwh"].fillna(0.0)
@@ -744,18 +752,10 @@ def main() -> None:
 
         st.divider()
         st.markdown("### Tabla: Cliente-Mes (Consumo + Base + Opt + Delta)")
-        st.dataframe(
-            df_clients[["nemo_cliente", "mes", "consumo_mwh", "asignado_baseline_mwh", "asignado_opt_mwh", "delta_asignado_mwh"]],
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(df_clients[["nemo_cliente", "mes", "consumo_mwh", "asignado_baseline_mwh", "asignado_opt_mwh", "delta_asignado_mwh"]], use_container_width=True, hide_index=True)
 
         st.markdown("### Tabla: Generador-Mes (Disponible + Base + Opt + Delta)")
-        st.dataframe(
-            df_gens[["nemo_generador", "mes", "disponible_mwh", "tomado_baseline_mwh", "tomado_opt_mwh", "delta_tomado_mwh"]],
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(df_gens[["nemo_generador", "mes", "disponible_mwh", "tomado_baseline_mwh", "tomado_opt_mwh", "delta_tomado_mwh"]], use_container_width=True, hide_index=True)
 
         df_min_viol_opt = st.session_state.get("opt_min_viol", pd.DataFrame())
         if not df_min_viol_opt.empty:
@@ -763,7 +763,7 @@ def main() -> None:
             st.error("### Incumplimientos de mínimo (OPT)")
             st.dataframe(df_min_viol_opt, use_container_width=True, hide_index=True)
 
-        # -------------------- SOLO 3 gráficos --------------------
+    # -------------------- SOLO 3 gráficos --------------------
         st.divider()
         st.markdown("## Gráficos")
 
