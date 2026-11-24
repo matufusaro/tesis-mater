@@ -7,6 +7,7 @@ import streamlit as st
 
 import sys
 from pathlib import Path
+from typing import Any, Callable
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -48,6 +49,13 @@ def _pick_first_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
         if c in df.columns:
             return c
     return None
+
+
+def _style_cells(styler: Any, formatter: Callable[[Any], str], subset: str | list[str]) -> Any:
+    style_map = getattr(styler, "map", None)
+    if callable(style_map):
+        return style_map(formatter, subset=subset)
+    return styler.applymap(formatter, subset=subset)
 
 
 # -------------------- Penalidad TOP + Economía anual --------------------
@@ -971,7 +979,7 @@ def main() -> None:
                 top_table["Diferencia"] = top_table["Diferencia"].round(0).astype(int)
                 top_table = top_table[["Generador", "Energía total disponible", "Energía mínima TOP", "Energía asignada", "Diferencia"]]
                 st.dataframe(
-                    top_table.style.map(
+                    _style_cells(top_table.style,
                         lambda v: "color: #B91C1C; font-weight: 700" if isinstance(v, (int, float, np.integer, np.floating)) and v < 0 else "",
                         subset=["Diferencia"],
                     ),
@@ -984,129 +992,39 @@ def main() -> None:
             st.markdown("### Clientes bajo mínimo contractual anual")
             if not clientes_anual.empty and {"nemo_cliente", "energia_real_anual_mwh", "min_anual_mwh"}.issubset(clientes_anual.columns):
                 min_clientes = clientes_anual.copy()
-                min_clientes["nemo_cliente"] = min_clientes["nemo_cliente"].astype(str)
-                min_clientes["min_anual_mwh"] = pd.to_numeric(min_clientes["min_anual_mwh"], errors="coerce").fillna(0.0)
                 min_clientes["energia_real_anual_mwh"] = pd.to_numeric(min_clientes["energia_real_anual_mwh"], errors="coerce").fillna(0.0)
+                min_clientes["min_anual_mwh"] = pd.to_numeric(min_clientes["min_anual_mwh"], errors="coerce").fillna(0.0)
                 min_clientes["Diferencia"] = min_clientes["energia_real_anual_mwh"] - min_clientes["min_anual_mwh"]
                 min_clientes = min_clientes[min_clientes["Diferencia"] < -1e-9].copy()
-
-                nombres_clientes = pd.DataFrame()
-                if not df_cons_y.empty and "nombre_cliente" in df_cons_y.columns:
-                    nombres_clientes = (
-                        df_cons_y.groupby("nemo_cliente", as_index=False)["nombre_cliente"]
-                        .agg(lambda s: " / ".join(sorted(set(str(v) for v in s.dropna() if str(v).strip()))))
-                    )
-                    nombres_clientes["nemo_cliente"] = nombres_clientes["nemo_cliente"].astype(str)
-
-                if not min_clientes.empty:
-                    min_clientes["Cliente"] = min_clientes["nemo_cliente"]
-                    if not nombres_clientes.empty:
-                        min_clientes = min_clientes.merge(
-                            nombres_clientes.rename(columns={"nombre_cliente": "Cliente"}),
-                            on="nemo_cliente",
-                            how="left",
-                            suffixes=("", "_nombre"),
-                        )
-                        if "Cliente_nombre" in min_clientes.columns:
-                            min_clientes["Cliente"] = min_clientes["Cliente_nombre"].fillna(min_clientes["Cliente"])
-
-                    min_clientes = min_clientes.sort_values("Diferencia")
-                    min_melt = min_clientes.melt(
-                        id_vars=["Cliente", "nemo_cliente", "Diferencia"],
-                        value_vars=["min_anual_mwh", "energia_real_anual_mwh"],
-                        var_name="Serie",
-                        value_name="MWh",
-                    )
-                    min_melt["Serie"] = min_melt["Serie"].map({
-                        "min_anual_mwh": "Mínimo comprometido",
-                        "energia_real_anual_mwh": "Asignado",
-                    })
-                    fig_min = px.bar(
-                        min_melt,
-                        x="Cliente",
-                        y="MWh",
-                        color="Serie",
-                        barmode="group",
-                        custom_data=["nemo_cliente"],
-                        color_discrete_map={"Mínimo comprometido": "#6A9FC3", "Asignado": "#B91C1C"},
-                        category_orders={"Cliente": min_clientes["Cliente"].tolist()},
-                    )
-                    fig_min.update_traces(hovertemplate="Cliente: %{x}<br>NEMO: %{customdata[0]}<br>%{y:,.0f} MWh<extra></extra>")
-                    fig_min.update_layout(height=400, margin=dict(l=20, r=20, t=20, b=100), legend_title_text="Serie", xaxis_title="Cliente", yaxis_title="Energía anual (MWh)")
-                    st.plotly_chart(fig_min, use_container_width=True)
-
-                    min_table = min_clientes.copy()
-                    min_table["Energía mínima comprometida"] = min_table["min_anual_mwh"].round(0).astype(int)
-                    min_table["Energía asignada"] = min_table["energia_real_anual_mwh"].round(0).astype(int)
-                    min_table["Diferencia"] = min_table["Diferencia"].round(0).astype(int)
-                    min_table = min_table[["Cliente", "Energía mínima comprometida", "Energía asignada", "Diferencia"]]
-                    st.dataframe(
-                        min_table.style.map(
-                            lambda v: "color: #B91C1C; font-weight: 700" if isinstance(v, (int, float, np.integer, np.floating)) and v < 0 else "",
-                            subset=["Diferencia"],
-                        ),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
+                if min_clientes.empty:
+                    st.success("Cumplimiento total: ningún cliente está bajo su mínimo contractual anual.")
                 else:
-                    st.success("Cumplimiento total: ningún cliente se encuentra bajo su mínimo contractual anual.")
+                    st.dataframe(min_clientes[["nemo_cliente", "min_anual_mwh", "energia_real_anual_mwh", "Diferencia"]], use_container_width=True, hide_index=True)
             else:
-                st.info("No hay datos suficientes en `clientes_anual` para verificar mínimos contractuales.")
+                st.info("No hay datos suficientes para verificar mínimos contractuales.")
 
             st.markdown("### Clientes sobreasignados frente al máximo contractual anual")
             if not clientes_anual.empty and {"nemo_cliente", "energia_real_anual_mwh", "max_anual_mwh"}.issubset(clientes_anual.columns):
                 max_clientes = clientes_anual.copy()
-                max_clientes["nemo_cliente"] = max_clientes["nemo_cliente"].astype(str)
                 max_clientes["max_anual_mwh"] = pd.to_numeric(max_clientes["max_anual_mwh"], errors="coerce")
                 max_clientes["energia_real_anual_mwh"] = pd.to_numeric(max_clientes["energia_real_anual_mwh"], errors="coerce").fillna(0.0)
                 max_clientes = max_clientes[max_clientes["max_anual_mwh"].notna()].copy()
                 max_clientes["Diferencia"] = max_clientes["energia_real_anual_mwh"] - max_clientes["max_anual_mwh"]
                 max_clientes = max_clientes[max_clientes["Diferencia"] > 1e-9].copy()
-
-                cantidad_max_sobre = int(max_clientes["nemo_cliente"].nunique()) if not max_clientes.empty else 0
-                st.metric("Clientes sobreasignados frente al máximo anual", f"{cantidad_max_sobre:,}")
-
-                if not max_clientes.empty:
-                    max_clientes["Cliente"] = max_clientes["nemo_cliente"]
-                    if not nombres_clientes.empty:
-                        max_clientes = max_clientes.merge(
-                            nombres_clientes.rename(columns={"nombre_cliente": "Cliente nombre"}),
-                            on="nemo_cliente",
-                            how="left",
-                        )
-                        if "Cliente nombre" in max_clientes.columns:
-                            max_clientes["Cliente"] = max_clientes["Cliente nombre"].fillna(max_clientes["Cliente"])
-                    max_clientes = max_clientes.sort_values("Diferencia", ascending=False)
-                    max_table = max_clientes[["Cliente", "max_anual_mwh", "energia_real_anual_mwh", "Diferencia"]].copy()
-                    max_table = max_table.rename(columns={
-                        "max_anual_mwh": "Energía máxima acordada",
-                        "energia_real_anual_mwh": "Energía asignada",
-                    })
-                    max_table["Energía máxima acordada"] = max_table["Energía máxima acordada"].round(0).astype(int)
-                    max_table["Energía asignada"] = max_table["Energía asignada"].round(0).astype(int)
-                    max_table["Diferencia"] = max_table["Diferencia"].round(0).astype(int)
-                    st.dataframe(
-                        max_table.style.map(
-                            lambda v: "color: #B91C1C; font-weight: 700" if isinstance(v, (int, float, np.integer, np.floating)) and v > 0 else "",
-                            subset=["Diferencia"],
-                        ),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                else:
+                if max_clientes.empty:
                     st.success("No existen sobreasignaciones frente al máximo contractual anual.")
+                else:
+                    st.dataframe(max_clientes[["nemo_cliente", "max_anual_mwh", "energia_real_anual_mwh", "Diferencia"]], use_container_width=True, hide_index=True)
             else:
-                st.info("No hay datos suficientes en `clientes_anual` para verificar sobreasignaciones frente a `max_anual_mwh`.")
-
-            st.caption("Los resultados mensuales frente al consumo y los máximos contractuales anuales se presentan por separado.")
+                st.info("No hay datos suficientes para verificar máximos contractuales anuales.")
 
             cons_cm = _consumption_by_client_month(df_cons_y)
             alloc_cm = _alloc_by_client_month(results)
             df_over_b = _client_month_overassign(cons_cm, alloc_cm)
             if df_over_b.empty:
-                st.success("OK: no se detectaron casos de asignación mayor al consumo.")
+                st.success("OK: no se detectaron asignaciones superiores al consumo mensual.")
             else:
-                st.error(f"Se detectaron {len(df_over_b)} filas cliente-mes con asignación > consumo.")
+                st.error(f"Se detectaron {df_over_b['nemo_cliente'].nunique()} clientes con exceso frente al consumo mensual.")
 
             st.divider()
             st.subheader("Exportación Excel")
@@ -1115,223 +1033,349 @@ def main() -> None:
             df_econ_b.columns = ["Concepto", "USD"]
             df_limits_b = _client_minmax_table(df_lim, results, int(anio))
             df_gen_take_b = _gen_avail_vs_taken_table(df_gen_y, results)
+            xlsx_all_b = _dfs_to_excel_bytes({
+                "economia_anual": df_econ_b,
+                "resumen_mensual": results["resumen_mensual"],
+                "por_generador_pr": results["por_generador_prioridad"],
+                "detalle": results["detalle"],
+                "minmax_cliente": df_limits_b,
+                "gen_disp_vs_tom": df_gen_take_b,
+                "overassign": df_over_b,
+            })
+            st.download_button("Descargar TODO Baseline (Excel)", data=xlsx_all_b, file_name=f"baseline_todo_{anio}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.download_button("Descargar resultados Baseline (Excel - formato estándar)", data=results_to_excel_bytes(results), file_name=f"resultados_baseline_{anio}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-            xlsx_all_b = _dfs_to_excel_bytes(
-                {
-                    "economia_anual": df_econ_b,
-                    "resumen_mensual": results["resumen_mensual"],
-                    "por_generador_pr": results["por_generador_prioridad"],
-                    "detalle": results["detalle"],
-                    "minmax_cliente": df_limits_b,
-                    "gen_disp_vs_tom": df_gen_take_b,
-                    "overassign": df_over_b,
-                }
-            )
-            st.download_button(
-                "Descargar TODO Baseline (Excel)",
-                data=xlsx_all_b,
-                file_name=f"baseline_todo_{anio}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-            st.download_button(
-                "Descargar resultados Baseline (Excel - formato estándar)",
-                data=results_to_excel_bytes(results),
-                file_name=f"resultados_baseline_{anio}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-            st.divider()
-            st.subheader("Detalle técnico y auditoría")
-
-            with st.expander("Economía anual", expanded=False):
+            with st.expander("Detalle técnico y auditoría", expanded=False):
                 st.dataframe(df_econ_b, use_container_width=True, hide_index=True)
-
-            with st.expander("Resumen mensual y compras por generador", expanded=False):
-                st.markdown("**Resumen mensual**")
                 st.dataframe(results["resumen_mensual"], use_container_width=True, hide_index=True)
-                st.markdown("**Compras por generador (PG1/PG2 internas)**")
                 st.dataframe(results["por_generador_prioridad"], use_container_width=True, hide_index=True)
-
-            with st.expander("Detalle de transacciones", expanded=False):
                 st.dataframe(results["detalle"], use_container_width=True, hide_index=True)
-
-            with st.expander("Mínimo / máximo anual por cliente", expanded=False):
                 st.dataframe(df_limits_b, use_container_width=True, hide_index=True)
-
-            with st.expander("Generadores: disponible vs tomado", expanded=False):
                 st.dataframe(df_gen_take_b, use_container_width=True, hide_index=True)
-
-            with st.expander("Validación: asignación mayor al consumo", expanded=False):
-                if df_over_b.empty:
-                    st.success("OK: no se detectaron casos de asignación mayor al consumo.")
-                else:
-                    st.dataframe(df_over_b, use_container_width=True, hide_index=True)
-
-            st.caption("Las tablas técnicas conservan las fórmulas, periodizaciones y resultados originales del simulador.", help=None)
+                st.dataframe(df_over_b, use_container_width=True, hide_index=True)
 
         st.divider()
         st.subheader("Edición de nominaciones mensuales")
         st.markdown("**`nominal_mwh` — nominaciones mensuales**")
-        edited = st.data_editor(
-            df_nom_y,
-            use_container_width=True,
-            disabled=[c for c in df_nom_y.columns if c not in ["nominal_mwh"]],
-            hide_index=True,
-        )
+        edited = st.data_editor(df_nom_y, use_container_width=True, disabled=[c for c in df_nom_y.columns if c not in ["nominal_mwh"]], hide_index=True)
         st.session_state["baseline_nominal_edited_df"] = edited
 
-    # -------------------- TAB 2: Optimizador MILP --------------------
+    # -------------------- TAB 2: Optimización MILP --------------------
     with tab2:
-        st.subheader("Optimizador MILP")
+        st.title("OPTIMIZACIÓN")
+        df_gen_opt = _filter_year_scenario(df_gen, int(anio), gen_scen)
+        st.subheader("Generadores")
 
-        st.write(
-            "La MILP propone **nominaciones** (nominal_mwh por acuerdo-mes) para maximizar el margen esperado "
-            "bajo las restricciones cargadas. Luego se re-simula para obtener asignación real."
-        )
+        gen_annual = pd.DataFrame()
+        if not df_gen_opt.empty and {"nemo_generador", "energia_disponible_mwh"}.issubset(df_gen_opt.columns):
+            gen_data = df_gen_opt.copy()
+            gen_data["energia_disponible_mwh"] = pd.to_numeric(gen_data["energia_disponible_mwh"], errors="coerce").fillna(0.0)
+            if "take_or_pay_ratio" not in gen_data.columns:
+                gen_data["take_or_pay_ratio"] = 0.0
+            gen_data["take_or_pay_ratio"] = pd.to_numeric(gen_data["take_or_pay_ratio"], errors="coerce").fillna(0.0)
+            gen_annual = gen_data.groupby("nemo_generador", as_index=False).agg(
+                energia_disponible_anual_mwh=("energia_disponible_mwh", "sum"),
+                take_or_pay_ratio=("take_or_pay_ratio", "max"),
+            )
+            gen_annual["min_take_anual_mwh"] = gen_annual["energia_disponible_anual_mwh"] * gen_annual["take_or_pay_ratio"]
 
-        st.info(
-            "Si querés que los **mínimos sean obligatorios** y el sistema no alcanza a cubrirlos, el resultado "
-            "debe considerarse **inaceptable**. Si está tildado 'Mínimos anuales obligatorios', se bloquea OPT si hay incumplimientos."
-        )
+        gen_count_opt = int(gen_annual["nemo_generador"].nunique()) if not gen_annual.empty else 0
+        avail_opt = float(gen_annual["energia_disponible_anual_mwh"].sum()) if not gen_annual.empty else 0.0
+        min_top_opt = float(gen_annual["min_take_anual_mwh"].sum()) if not gen_annual.empty else 0.0
+        gen_cards = st.columns(3)
+        gen_cards[0].metric("Generadores", f"{gen_count_opt:,}")
+        gen_cards[1].metric("Energía disponible", f"{_format_es_mwh(avail_opt)} MWh")
+        gen_cards[2].metric("Energía mínima TOP", f"{_format_es_mwh(min_top_opt)} MWh")
 
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
+        nominations_view = st.session_state["opt_solution"].df_nom_opt.copy() if "opt_solution" in st.session_state else st.session_state.get("baseline_nominal_edited_df", df_nom_base).copy()
+        if "anio" in nominations_view.columns:
+            nominations_view = nominations_view[_safe_int_series(nominations_view["anio"]) == int(anio)].copy()
+        if not nominations_view.empty and {"prioridad_asignacion", "nominal_mwh"}.issubset(nominations_view.columns):
+            nominations_view["prioridad_asignacion"] = pd.to_numeric(nominations_view["prioridad_asignacion"], errors="coerce")
+            nominations_view["nominal_mwh"] = pd.to_numeric(nominations_view["nominal_mwh"], errors="coerce").fillna(0.0)
+            nominations_view = nominations_view.dropna(subset=["prioridad_asignacion"])
+            priority_opt = nominations_view.groupby("prioridad_asignacion", as_index=False)["nominal_mwh"].sum().sort_values("prioridad_asignacion")
+            priority_opt = priority_opt.rename(columns={"prioridad_asignacion": "Prioridad", "nominal_mwh": "Energía nominada (MWh)"})
+            total_priority_opt = float(priority_opt["Energía nominada (MWh)"].sum())
+            priority_opt["Porcentaje"] = priority_opt["Energía nominada (MWh)"].div(total_priority_opt).mul(100.0) if total_priority_opt > 0 else 0.0
+            priority_opt["Prioridad"] = priority_opt["Prioridad"].apply(lambda value: str(int(value)) if float(value).is_integer() else str(value))
+            priority_palette = ["#0B3C5D", "#1F5A86", "#397CBF", "#69A2D1", "#8EBCE0", "#B0CEE8", "#5C718A", "#7F9DBB"]
+            priority_colors = {value: priority_palette[index % len(priority_palette)] for index, value in enumerate(priority_opt["Prioridad"].tolist())}
+            priority_opt["Fila"] = "Nominado"
+            priority_opt["Etiqueta"] = priority_opt.apply(lambda row: f"P{row['Prioridad']}" if row["Porcentaje"] >= 8 else "", axis=1)
+            priority_fig_opt = px.bar(priority_opt, x="Energía nominada (MWh)", y="Fila", color="Prioridad", orientation="h", barmode="stack", color_discrete_map=priority_colors, text="Etiqueta")
+            priority_fig_opt.update_layout(height=125, margin=dict(l=20, r=20, t=10, b=30), showlegend=False, xaxis_title="MWh nominados", yaxis=dict(showticklabels=False, title=""))
+            priority_fig_opt.update_traces(textposition="inside", insidetextanchor="middle")
+            st.markdown("**Distribución de energía nominada por prioridad**")
+            st.plotly_chart(priority_fig_opt, use_container_width=True)
+            st.caption(" · ".join(f"P{row['Prioridad']}: {_format_es_mwh(float(row['Energía nominada (MWh)']))} MWh · {float(row['Porcentaje']):.1f}%" for _, row in priority_opt.iterrows()))
+
+            if "nemo_generador" in nominations_view.columns:
+                gen_detail_opt = nominations_view.groupby(["nemo_generador", "prioridad_asignacion"], as_index=False)["nominal_mwh"].sum()
+                gen_detail_opt = gen_detail_opt.rename(columns={"nemo_generador": "NEMO", "prioridad_asignacion": "Prioridad", "nominal_mwh": "Energía nominada (MWh)"})
+                gen_detail_opt["Prioridad"] = gen_detail_opt["Prioridad"].apply(lambda value: str(int(value)) if float(value).is_integer() else str(value))
+                gen_names_opt = pd.DataFrame(columns=["NEMO", "Generador"])
+                if "nombre_generador" in df_gen_opt.columns:
+                    gen_names_opt = df_gen_opt.groupby("nemo_generador", as_index=False)["nombre_generador"].agg(lambda values: " / ".join(sorted(set(str(value) for value in values.dropna() if str(value).strip())))).rename(columns={"nemo_generador": "NEMO", "nombre_generador": "Generador"})
+                gen_detail_opt = gen_detail_opt.merge(gen_names_opt, on="NEMO", how="left")
+                if "precio_compra_usd_mwh" in df_gen_opt.columns:
+                    gen_prices_opt = df_gen_opt.copy()
+                    gen_prices_opt["precio_compra_usd_mwh"] = pd.to_numeric(gen_prices_opt["precio_compra_usd_mwh"], errors="coerce")
+                    gen_prices_opt = gen_prices_opt.dropna(subset=["precio_compra_usd_mwh"]).groupby("nemo_generador", as_index=False)["precio_compra_usd_mwh"].agg(lambda values: " / ".join(f"{float(value):,.2f}" for value in sorted(set(values)))).rename(columns={"nemo_generador": "NEMO", "precio_compra_usd_mwh": "Precio(s) compra (USD/MWh)"})
+                    gen_detail_opt = gen_detail_opt.merge(gen_prices_opt, on="NEMO", how="left")
+                if "Generador" not in gen_detail_opt.columns:
+                    gen_detail_opt["Generador"] = gen_detail_opt["NEMO"]
+                gen_detail_opt["Generador"] = gen_detail_opt["Generador"].fillna(gen_detail_opt["NEMO"])
+                if "Precio(s) compra (USD/MWh)" not in gen_detail_opt.columns:
+                    gen_detail_opt["Precio(s) compra (USD/MWh)"] = "No disponible"
+                gen_detail_opt["Energía nominada (MWh)"] = gen_detail_opt["Energía nominada (MWh)"].round().astype(int)
+                with st.expander("Detalle por generador", expanded=False):
+                    st.dataframe(gen_detail_opt[["Generador", "NEMO", "Prioridad", "Energía nominada (MWh)", "Precio(s) compra (USD/MWh)"]].sort_values(["Generador", "Prioridad"]), use_container_width=True, hide_index=True)
+        else:
+            st.info("No hay nominaciones para mostrar la distribución por prioridad.")
+
+        st.divider()
+        st.subheader("Optimización")
+        def _format_opt_display(value: float) -> str:
+            return f"{value:,.0f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+        st.write("La MILP propone nominaciones mensuales y se re-simula para obtener resultados comparables con Baseline.")
+        control_columns = st.columns(3)
+        with control_columns[0]:
             min_block = st.number_input("Mínimo por activación (P2+) [MWh]", min_value=0.0, value=50.0, step=10.0)
-        with col2:
+        with control_columns[1]:
             pen = st.number_input("Penalización fija por activación P2+ [USD]", min_value=0.0, value=0.0, step=50.0)
-        with col3:
+        with control_columns[2]:
             tlim = st.number_input("Límite de tiempo solver [s]", min_value=5, value=30, step=5)
-        with col4:
-            run_opt = st.button("Ejecutar optimización MILP", type="primary")
 
+        run_opt = st.button("Ejecutar optimización MILP", type="primary")
         if run_opt:
-            df_gen_y = _filter_year_scenario(df_gen, int(anio), gen_scen)
-            df_cons_y = _filter_year_scenario(df_cons, int(anio), cons_scen)
-
+            df_gen_opt = _filter_year_scenario(df_gen, int(anio), gen_scen)
+            df_cons_opt = _filter_year_scenario(df_cons, int(anio), cons_scen)
             try:
-                sol = solve_milp_nominal(
-                    df_gen=df_gen_y,
-                    df_cons=df_cons_y,
-                    df_lim=df_lim,
-                    df_nom_template=df_nom_base,
-                    anio=int(anio),
-                    gen_scenario=None,
-                    cons_scenario=None,
-                    min_block_mwh_p2=float(min_block),
-                    fixed_penalty_p2_usd=float(pen),
-                    solver_time_limit_s=int(tlim),
-                )
+                sol = solve_milp_nominal(df_gen=df_gen_opt, df_cons=df_cons_opt, df_lim=df_lim, df_nom_template=df_nom_base, anio=int(anio), gen_scenario=None, cons_scenario=None, min_block_mwh_p2=float(min_block), fixed_penalty_p2_usd=float(pen), solver_time_limit_s=int(tlim))
+                results_opt = simulate_cammesa(df_gen_opt, df_cons_opt, df_lim, sol.df_nom_opt, anio=int(anio))
+                limits_opt = _client_minmax_table(df_lim, results_opt, int(anio))
+                violations_opt = _min_violations_table(limits_opt)
+                overassign_month_opt = _client_month_overassign(_consumption_by_client_month(df_cons_opt), _alloc_by_client_month(results_opt))
+                st.session_state["opt_solution"] = sol
+                st.session_state["opt_results"] = results_opt
+                st.session_state["opt_meta"] = {"anio": int(anio), "gen": gen_scen, "cons": cons_scen}
+                st.session_state["opt_gen_y"] = df_gen_opt
+                st.session_state["opt_cons_y"] = df_cons_opt
+                st.session_state["opt_limits"] = limits_opt
+                st.session_state["opt_overassign"] = overassign_month_opt
+                st.session_state["opt_min_viol"] = violations_opt
             except ModuleNotFoundError:
                 st.error("No está instalada la biblioteca 'pulp'. Instalá dependencias con: `pip install -r requirements.txt`")
                 st.stop()
-
-            results_opt = simulate_cammesa(df_gen_y, df_cons_y, df_lim, sol.df_nom_opt, anio=int(anio))
-            df_limits_o = _client_minmax_table(df_lim, results_opt, int(anio))
-            df_min_viol = _min_violations_table(df_limits_o)
-            cons_cm = _consumption_by_client_month(df_cons_y)
-            alloc_cm = _alloc_by_client_month(results_opt)
-            df_over_o = _client_month_overassign(cons_cm, alloc_cm)
-
-            st.session_state["opt_solution"] = sol
-            st.session_state["opt_results"] = results_opt
-            st.session_state["opt_meta"] = {"anio": int(anio), "gen": gen_scen, "cons": cons_scen}
-            st.session_state["opt_gen_y"] = df_gen_y
-            st.session_state["opt_cons_y"] = df_cons_y
-            st.session_state["opt_limits"] = df_limits_o
-            st.session_state["opt_overassign"] = df_over_o
-            st.session_state["opt_min_viol"] = df_min_viol
-            st.session_state["opt_blocked"] = bool(strict_min and not df_min_viol.empty)
+            except Exception as error:
+                st.error(f"Error crítico durante la optimización: {error}")
+                st.stop()
 
         if "opt_solution" in st.session_state:
-            sol = st.session_state["opt_solution"]
-            st.markdown(f"**Estado solver:** {sol.status}")
-            st.markdown(f"**Objetivo (USD):** {sol.objective_usd:,.0f}")
-            st.markdown("### Nominaciones propuestas (preview)")
-            st.dataframe(sol.df_nom_opt.head(200), use_container_width=True, hide_index=True)
-            st.download_button(
-                "Descargar nominaciones optimizadas (Excel)",
-                data=_df_to_excel_bytes(sol.df_nom_opt, "nominaciones_opt"),
-                file_name=f"nominaciones_opt_{anio}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            solution = st.session_state["opt_solution"]
+            st.caption(f"Estado solver: {solution.status} · Objetivo: {_format_opt_display(solution.objective_usd)} USD")
+            with st.expander("Nominaciones propuestas", expanded=False):
+                st.dataframe(solution.df_nom_opt.head(200), use_container_width=True, hide_index=True)
+            st.download_button("Descargar nominaciones optimizadas (Excel)", data=_df_to_excel_bytes(solution.df_nom_opt, "nominaciones_opt"), file_name=f"nominaciones_opt_{anio}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
         if "opt_results" in st.session_state:
-            results = st.session_state["opt_results"]
-            df_gen_y = st.session_state["opt_gen_y"]
-            df_cons_y = st.session_state["opt_cons_y"]
-            k = _kpis(results)
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Margen neto anual (USD)", f"{k['Margen neto anual (USD)']:,.0f}")
-            c2.metric("Penalidad TOP anual (USD)", f"{k['Penalidad TOP anual (USD)']:,.0f}")
-            c3.metric("Energía asignada anual (MWh)", f"{k['Energía asignada anual (MWh)']:,.0f}")
-            c4.metric("Energía no abastecida anual (MWh)", f"{k['Energía no abastecida anual (MWh)']:,.0f}")
+            opt_result = st.session_state["opt_results"]
+            df_gen_opt = st.session_state["opt_gen_y"]
+            df_cons_opt = st.session_state["opt_cons_y"]
+            baseline_result_opt = st.session_state.get("baseline_results")
+            baseline_meta_opt = st.session_state.get("baseline_meta", {})
+            optimizer_meta = st.session_state.get("opt_meta", {})
+            comparable = isinstance(baseline_result_opt, dict) and all(meta.get(key) == value for meta in [baseline_meta_opt, optimizer_meta] for key, value in {"anio": int(anio), "gen": gen_scen, "cons": cons_scen}.items())
 
-            st.divider()
-            st.markdown("### Economía anual (OPT)")
-            econ_o = _annual_economics(results)
+            def _optimization_metrics(source: dict[str, pd.DataFrame]) -> dict[str, float]:
+                summary = source.get("resumen_mensual", pd.DataFrame())
+                top = source.get("take_or_pay_anual", pd.DataFrame())
+                clients = source.get("clientes_anual", pd.DataFrame())
+                unserved = source.get("no_abastecido", pd.DataFrame())
+                shortfall = pd.to_numeric(top.get("shortfall_anual_mwh", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+                under_count = over_count = 0
+                if not clients.empty and {"nemo_cliente", "energia_real_anual_mwh", "min_anual_mwh"}.issubset(clients.columns):
+                    annual = clients.copy()
+                    for field in ["energia_real_anual_mwh", "min_anual_mwh"]:
+                        annual[field] = pd.to_numeric(annual[field], errors="coerce").fillna(0.0)
+                    group_fields = {"energia_real_anual_mwh": ("energia_real_anual_mwh", "max"), "min_anual_mwh": ("min_anual_mwh", "max")}
+                    if "max_anual_mwh" in annual.columns:
+                        annual["max_anual_mwh"] = pd.to_numeric(annual["max_anual_mwh"], errors="coerce")
+                        group_fields["max_anual_mwh"] = ("max_anual_mwh", "max")
+                    annual = annual.groupby("nemo_cliente", as_index=False).agg(**group_fields)
+                    under_count = int((annual["energia_real_anual_mwh"] < annual["min_anual_mwh"] - 1e-9).sum())
+                    if "max_anual_mwh" in annual.columns:
+                        finite = annual["max_anual_mwh"].notna() & annual["max_anual_mwh"].ne(float("inf"))
+                        over_count = int((finite & (annual["energia_real_anual_mwh"] > annual["max_anual_mwh"] + 1e-9)).sum())
+                return {
+                    "Energía asignada": float(pd.to_numeric(summary.get("energia_asignada_mwh", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()),
+                    "Energía no abastecida": float(pd.to_numeric(unserved.get("no_abastecido_mwh", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()),
+                    "Energía TOP": float(shortfall.sum()),
+                    "Margen Bruto Operativo": float(pd.to_numeric(summary.get("margen_usd", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()),
+                    "Penalidad TOP": float(pd.to_numeric(top.get("penalidad_anual_usd", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()),
+                    "Generadores bajo TOP": float((shortfall > 1e-9).sum()),
+                    "Clientes bajo mínimo": float(under_count),
+                    "Clientes sobre máximo anual": float(over_count),
+                }
+
+            optimized = _optimization_metrics(opt_result)
+            baseline = _optimization_metrics(baseline_result_opt) if comparable else {}
+            st.caption("Diferencias respecto de Baseline con el mismo año y escenarios." if comparable else "Ejecutá Baseline con esta misma selección para habilitar las diferencias.")
+            metric_info = [("Energía asignada (MWh)", "Energía asignada", True), ("Energía no abastecida (MWh)", "Energía no abastecida", False), ("Energía TOP (MWh)", "Energía TOP", False), ("Margen Bruto Operativo (USD)", "Margen Bruto Operativo", True), ("Penalidad TOP (USD)", "Penalidad TOP", False), ("Generadores bajo TOP", "Generadores bajo TOP", False), ("Clientes bajo mínimo", "Clientes bajo mínimo", False), ("Clientes sobre máximo anual", "Clientes sobre máximo anual", False)]
+            for offset in range(0, len(metric_info), 4):
+                metric_columns = st.columns(4)
+                for column, (label, key, good_up) in zip(metric_columns, metric_info[offset:offset + 4]):
+                    value = optimized[key]
+                    is_count = key in {"Generadores bajo TOP", "Clientes bajo mínimo", "Clientes sobre máximo anual"}
+                    text = f"{int(value):,}" if is_count else _format_opt_display(value)
+                    if comparable:
+                        diff = value - baseline[key]
+                        diff_text = f"{diff:+,.0f}" if is_count else _format_opt_display(diff)
+                        if baseline[key] != 0:
+                            diff_text += f" ({diff / abs(baseline[key]) * 100:+.1f}%)"
+                        column.metric(label, text, delta=diff_text, delta_color="normal" if good_up else "inverse")
+                    else:
+                        column.metric(label, text)
+
+            month_labels = {1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio", 7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"}
+            def _monthly_alloc(source: dict[str, pd.DataFrame], label: str) -> pd.DataFrame:
+                det = source.get("detalle", pd.DataFrame()).copy()
+                if det.empty or not {"mes", "asignado_MWh"}.issubset(detalle.columns):
+                    return pd.DataFrame(columns=["mes_num", "Mes", "MWh", "Escenario"])
+                det["mes"] = pd.to_numeric(det["mes"], errors="coerce")
+                det["asignado_MWh"] = pd.to_numeric(det["asignado_MWh"], errors="coerce").fillna(0.0)
+                monthly = det.groupby("mes", as_index=False)["asignado_MWh"].sum().set_index("mes").reindex(range(1, 13), fill_value=0).reset_index()
+                monthly["mes_num"] = monthly["mes"].astype(int)
+                monthly["Mes"] = monthly["mes_num"].map(month_labels)
+                monthly["MWh"] = monthly["asignado_MWh"]
+                monthly["Escenario"] = label
+                return monthly[["mes_num", "Mes", "MWh", "Escenario"]]
+
+            monthly_opt = _monthly_alloc(opt_result, "Optimización")
+            monthly_data = pd.concat([_monthly_alloc(baseline_result_opt, "Baseline"), monthly_opt], ignore_index=True) if comparable else monthly_opt
+            st.markdown("### Energía asignada mensual: Baseline vs Optimización")
+            monthly_fig = px.bar(monthly_data, x="Mes", y="MWh", color="Escenario", barmode="group", category_orders={"Mes": list(month_labels.values())}, color_discrete_map={"Baseline": "#8FA9BC", "Optimización": "#0B3C5D"})
+            monthly_fig.update_traces(hovertemplate="%{x}<br>%{y:,.0f} MWh<extra>%{fullData.name}</extra>")
+            monthly_fig.update_layout(height=350, xaxis_title="Mes", yaxis_title="Energía asignada (MWh)", margin=dict(l=15, r=15, t=15, b=15))
+            st.plotly_chart(monthly_fig, use_container_width=True)
+            if abs(float(monthly_opt["MWh"].sum()) - optimized["Energía asignada"]) > 1e-6:
+                st.warning("La suma mensual no coincide con el resumen de asignación anual.")
+
+            top_result = opt_result.get("take_or_pay_anual", pd.DataFrame()).copy()
+            st.markdown("### Cumplimiento TOP por generador en Optimización")
+            top_required = {"nemo_generador", "energia_disponible_anual_mwh", "min_take_anual_mwh", "energia_tomada_anual_mwh", "shortfall_anual_mwh"}
+            if not top_result.empty and top_required.issubset(top_result.columns):
+                top_result["nemo_generador"] = top_result["nemo_generador"].astype(str)
+                top_result["Diferencia"] = pd.to_numeric(top_result["energia_tomada_anual_mwh"], errors="coerce").fillna(0.0) - pd.to_numeric(top_result["min_take_anual_mwh"], errors="coerce").fillna(0.0)
+                names_map = df_gen_opt.groupby("nemo_generador")["nombre_generador"].agg(lambda values: " / ".join(sorted(set(str(v) for v in values.dropna() if str(v).strip())))).to_dict() if "nombre_generador" in df_gen_opt.columns else {}
+                top_result["Generador"] = top_result["nemo_generador"].map(names_map).fillna(top_result["nemo_generador"])
+                top_failed = top_result[pd.to_numeric(top_result["shortfall_anual_mwh"], errors="coerce").fillna(0.0) > 1e-9].copy()
+                if top_failed.empty:
+                    st.success("Cumplimiento total de TOP contractual")
+                else:
+                    top_plot = top_failed.melt(id_vars=["Generador", "nemo_generador"], value_vars=["min_take_anual_mwh", "energia_tomada_anual_mwh"], var_name="Serie", value_name="MWh")
+                    top_plot["Serie"] = top_plot["Serie"].map({"min_take_anual_mwh": "Mínimo TOP", "energia_tomada_anual_mwh": "Asignado"})
+                    top_fig = px.bar(top_plot, x="Generador", y="MWh", color="Serie", barmode="group", custom_data=["nemo_generador"], color_discrete_map={"Mínimo TOP": "#7DA5C4", "Asignado": "#B93A3A"}, category_orders={"Generador": top_failed["Generador"].tolist()})
+                    top_fig.update_traces(hovertemplate="%{x}<br>NEMO %{customdata[0]}<br>%{y:,.0f} MWh<extra></extra>")
+                    top_fig.update_layout(height=360, xaxis_title="Generador", yaxis_title="Energía anual (MWh)", margin=dict(l=15, r=15, t=15, b=100))
+                    st.plotly_chart(top_fig, use_container_width=True)
+                top_table = top_result[["Generador", "energia_disponible_anual_mwh", "min_take_anual_mwh", "energia_tomada_anual_mwh", "Diferencia"]].copy()
+                top_table.columns = ["Generador", "Energía total disponible", "Energía mínima TOP", "Energía asignada", "Diferencia"]
+                for col in top_table.columns[1:]:
+                    top_table[col] = pd.to_numeric(top_table[col], errors="coerce").fillna(0.0).round().astype(int)
+                st.dataframe(_style_cells(top_table.style, lambda value: "color:#B91C1C;font-weight:700" if isinstance(value, (int, float, np.integer, np.floating)) and value < 0 else "", subset=["Diferencia"]), use_container_width=True, hide_index=True)
+            else:
+                st.info("No hay datos suficientes en `take_or_pay_anual` para el análisis TOP.")
+
+            opt_clients = opt_result.get("clientes_anual", pd.DataFrame()).copy()
+            client_names_opt = df_cons_opt.groupby("nemo_cliente")["nombre_cliente"].agg(lambda values: " / ".join(sorted(set(str(v) for v in values.dropna() if str(v).strip())))).to_dict() if "nombre_cliente" in df_cons_opt.columns else {}
+            st.markdown("### Clientes bajo mínimo contractual")
+            if not opt_clients.empty and {"nemo_cliente", "energia_real_anual_mwh", "min_anual_mwh"}.issubset(opt_clients.columns):
+                for col in ["energia_real_anual_mwh", "min_anual_mwh"]:
+                    opt_clients[col] = pd.to_numeric(opt_clients[col], errors="coerce").fillna(0.0)
+                opt_clients["Diferencia"] = opt_clients["energia_real_anual_mwh"] - opt_clients["min_anual_mwh"]
+                opt_clients = opt_clients.groupby("nemo_cliente", as_index=False).agg(energia_real_anual_mwh=("energia_real_anual_mwh", "max"), min_anual_mwh=("min_anual_mwh", "max"), Diferencia=("Diferencia", "min"))
+                under_min_clients = opt_clients[opt_clients["Diferencia"] < -1e-9].sort_values("Diferencia")
+                if under_min_clients.empty:
+                    st.success("Cumplimiento total de los mínimos contractuales")
+                else:
+                    under_min_clients["Cliente"] = under_min_clients["nemo_cliente"].map(client_names_opt).fillna(under_min_clients["nemo_cliente"])
+                    min_plot = under_min_clients.melt(id_vars=["Cliente", "nemo_cliente"], value_vars=["min_anual_mwh", "energia_real_anual_mwh"], var_name="Serie", value_name="MWh")
+                    min_plot["Serie"] = min_plot["Serie"].map({"min_anual_mwh": "Mínimo contractual", "energia_real_anual_mwh": "Asignado"})
+                    min_fig = px.bar(min_plot, x="Cliente", y="MWh", color="Serie", barmode="group", custom_data=["nemo_cliente"], color_discrete_map={"Mínimo contractual": "#7DA5C4", "Asignado": "#B93A3A"}, category_orders={"Cliente": under_min_clients["Cliente"].tolist()})
+                    min_fig.update_traces(hovertemplate="%{x}<br>NEMO %{customdata[0]}<br>%{y:,.0f} MWh<extra></extra>")
+                    min_fig.update_layout(height=360, xaxis_title="Cliente", yaxis_title="Energía anual (MWh)", margin=dict(l=15, r=15, t=15, b=100))
+                    st.plotly_chart(min_fig, use_container_width=True)
+                    min_table = under_min_clients.copy()
+                    min_table["Cliente"] = min_table["nemo_cliente"].map(client_names_opt).fillna(min_table["nemo_cliente"])
+                    min_table = min_table.rename(columns={"min_anual_mwh": "Energía mínima comprometida", "energia_real_anual_mwh": "Energía asignada"})
+                    for col in ["Energía mínima comprometida", "Energía asignada", "Diferencia"]:
+                        min_table[col] = min_table[col].round().astype(int)
+                    st.dataframe(_style_cells(min_table[["Cliente", "Energía mínima comprometida", "Energía asignada", "Diferencia"]].style, lambda value: "color:#B91C1C;font-weight:700" if isinstance(value, (int, float, np.integer, np.floating)) and value < 0 else "", subset=["Diferencia"]), use_container_width=True, hide_index=True)
+
+            st.markdown("### Clientes sobreasignados frente al máximo contractual anual")
+            if not opt_clients.empty and "max_anual_mwh" in opt_clients.columns:
+                opt_clients["max_anual_mwh"] = pd.to_numeric(opt_clients["max_anual_mwh"], errors="coerce")
+                annual_max_excess = opt_clients[opt_clients["max_anual_mwh"].notna() & opt_clients["max_anual_mwh"].ne(float("inf"))].copy()
+                annual_max_excess["Diferencia"] = annual_max_excess["energia_real_anual_mwh"] - annual_max_excess["max_anual_mwh"]
+                annual_max_excess = annual_max_excess[annual_max_excess["Diferencia"] > 1e-9].copy()
+                st.metric("Clientes sobre máximo anual", f"{annual_max_excess['nemo_cliente'].nunique():,}")
+                if annual_max_excess.empty:
+                    st.success("Cumplimiento total de las restricciones de máximo")
+                else:
+                    annual_max_excess["Cliente"] = annual_max_excess["nemo_cliente"].map(client_names_opt).fillna(annual_max_excess["nemo_cliente"])
+                    annual_max_excess = annual_max_excess.rename(columns={"max_anual_mwh": "Energía máxima acordada", "energia_real_anual_mwh": "Energía asignada"})
+                    for col in ["Energía máxima acordada", "Energía asignada", "Diferencia"]:
+                        annual_max_excess[col] = annual_max_excess[col].round().astype(int)
+                    st.dataframe(annual_max_excess[["Cliente", "Energía máxima acordada", "Energía asignada", "Diferencia"]], use_container_width=True, hide_index=True)
+            else:
+                st.info("No hay datos suficientes para verificar máximos contractuales anuales.")
+
+            st.markdown("### Asignación anual por cliente: Baseline vs Optimización")
+            if comparable:
+                base_clients = baseline_result_opt.get("clientes_anual", pd.DataFrame()).copy()
+                opt_clients_compare = opt_result.get("clientes_anual", pd.DataFrame()).copy()
+                if {"nemo_cliente", "energia_real_anual_mwh"}.issubset(base_clients.columns) and {"nemo_cliente", "energia_real_anual_mwh"}.issubset(opt_clients_compare.columns):
+                    base_clients = base_clients.groupby("nemo_cliente", as_index=False)["energia_real_anual_mwh"].max().rename(columns={"energia_real_anual_mwh": "Baseline (MWh)"})
+                    opt_clients_compare = opt_clients_compare.groupby("nemo_cliente", as_index=False)["energia_real_anual_mwh"].max().rename(columns={"energia_real_anual_mwh": "Optimización (MWh)"})
+                    annual_comparison = base_clients.merge(opt_clients_compare, on="nemo_cliente", how="outer").fillna(0.0)
+                    annual_comparison["Diferencia (MWh)"] = annual_comparison["Optimización (MWh)"] - annual_comparison["Baseline (MWh)"]
+                    annual_comparison["Cliente"] = annual_comparison["nemo_cliente"].map(client_names_opt).fillna(annual_comparison["nemo_cliente"])
+                    for col in ["Baseline (MWh)", "Optimización (MWh)", "Diferencia (MWh)"]:
+                        annual_comparison[col] = annual_comparison[col].round().astype(int)
+                    comparison_display = annual_comparison[["Cliente", "Baseline (MWh)", "Optimización (MWh)", "Diferencia (MWh)"]]
+                    st.dataframe(_style_cells(comparison_display.style, lambda value: "color:#137333;font-weight:700" if isinstance(value, (int, float, np.integer, np.floating)) and value > 0 else ("color:#B91C1C;font-weight:700" if isinstance(value, (int, float, np.integer, np.floating)) and value < 0 else ""), subset=["Diferencia (MWh)"]), use_container_width=True, hide_index=True)
+            else:
+                st.info("La comparación por cliente requiere Baseline con el mismo año y escenarios.")
+
+            monthly_over_opt = _client_month_overassign(_consumption_by_client_month(df_cons_opt), _alloc_by_client_month(opt_result))
+            if not monthly_over_opt.empty:
+                st.caption(f"Sobreasignación mensual respecto al consumo: {monthly_over_opt['nemo_cliente'].nunique():,} clientes; es un criterio distinto del máximo contractual anual.")
+
+            df_limits_o = st.session_state.get("opt_limits", _client_minmax_table(df_lim, opt_result, int(anio)))
+            df_min_viol = st.session_state.get("opt_min_viol", _min_violations_table(df_limits_o))
+            df_over_o = st.session_state.get("opt_overassign", monthly_over_opt)
+            econ_o = _annual_economics(opt_result)
             df_econ_o = pd.DataFrame([econ_o]).T.reset_index()
             df_econ_o.columns = ["Concepto", "USD"]
-            st.dataframe(df_econ_o, use_container_width=True, hide_index=True)
-
-            df_limits_o = st.session_state.get("opt_limits", _client_minmax_table(df_lim, results, int(anio)))
-            df_min_viol = st.session_state.get("opt_min_viol", _min_violations_table(df_limits_o))
-            df_over_o = st.session_state.get("opt_overassign", _client_month_overassign(_consumption_by_client_month(df_cons_y), _alloc_by_client_month(results)))
-
+            df_gen_take_o = _gen_avail_vs_taken_table(df_gen_opt, opt_result)
             if strict_min and not df_min_viol.empty:
                 st.error(f"OPT BLOQUEADO: se incumple mínimo anual en {len(df_min_viol)} clientes.")
             if strict_no_overassign and not df_over_o.empty:
-                st.error(f"OPT ALERTA: se detectó asignación > consumo en {len(df_over_o)} filas cliente-mes.")
-
-            st.divider()
-            st.markdown("### Resultados (Optimizado)")
-            st.markdown("**Resumen mensual**")
-            st.dataframe(results["resumen_mensual"], use_container_width=True, hide_index=True)
-            st.markdown("**Compras por generador (PG1/PG2 internas)**")
-            st.dataframe(results["por_generador_prioridad"], use_container_width=True, hide_index=True)
-            st.markdown("**Detalle de transacciones**")
-            st.dataframe(results["detalle"], use_container_width=True, hide_index=True)
-
-            st.divider()
-            st.markdown("### Mínimo / Máximo anual por cliente (OPT)")
-            st.dataframe(df_limits_o, use_container_width=True, hide_index=True)
-            st.divider()
-            st.markdown("### Generadores: disponible vs tomado (OPT)")
-            df_gen_take_o = _gen_avail_vs_taken_table(df_gen_y, results)
-            st.dataframe(df_gen_take_o, use_container_width=True, hide_index=True)
-            st.divider()
-            st.markdown("### Validación: asignación > consumo (OPT)")
-            if df_over_o.empty:
-                st.success("OK: no se detectaron casos de asignación mayor al consumo.")
-            else:
+                st.error(f"OPT ALERTA: se detectó asignación > consumo en {df_over_o['nemo_cliente'].nunique()} clientes.")
+            with st.expander("Detalle técnico y auditoría", expanded=False):
+                st.dataframe(opt_result["resumen_mensual"], use_container_width=True, hide_index=True)
+                st.dataframe(opt_result["por_generador_prioridad"], use_container_width=True, hide_index=True)
+                st.dataframe(opt_result["detalle"], use_container_width=True, hide_index=True)
+                st.dataframe(df_limits_o, use_container_width=True, hide_index=True)
+                st.dataframe(df_gen_take_o, use_container_width=True, hide_index=True)
                 st.dataframe(df_over_o, use_container_width=True, hide_index=True)
-
-            st.divider()
-            st.markdown("### Exportación (OPT)")
-            xlsx_all_o = _dfs_to_excel_bytes(
-                {
-                    "economia_anual": df_econ_o,
-                    "resumen_mensual": results["resumen_mensual"],
-                    "por_generador_pr": results["por_generador_prioridad"],
-                    "detalle": results["detalle"],
-                    "minmax_cliente": df_limits_o,
-                    "gen_disp_vs_tom": df_gen_take_o,
-                    "overassign": df_over_o,
-                    "min_viol": df_min_viol,
-                }
-            )
-            st.download_button(
-                "Descargar TODO OPT (Excel)",
-                data=xlsx_all_o,
-                file_name=f"opt_todo_{anio}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-            st.download_button(
-                "Descargar resultados OPT (Excel - formato estándar)",
-                data=results_to_excel_bytes(results),
-                file_name=f"resultados_opt_{anio}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+                st.dataframe(df_econ_o, use_container_width=True, hide_index=True)
+            xlsx_all_o = _dfs_to_excel_bytes({"economia_anual": df_econ_o, "resumen_mensual": opt_result["resumen_mensual"], "por_generador_pr": opt_result["por_generador_prioridad"], "detalle": opt_result["detalle"], "minmax_cliente": df_limits_o, "gen_disp_vs_tom": df_gen_take_o, "overassign": df_over_o, "min_viol": df_min_viol})
+            st.download_button("Descargar TODO OPT (Excel)", data=xlsx_all_o, file_name=f"opt_todo_{anio}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.download_button("Descargar resultados OPT (Excel - formato estándar)", data=results_to_excel_bytes(opt_result), file_name=f"resultados_opt_{anio}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     # -------------------- TAB 3: Comparativa --------------------
     with tab3:
