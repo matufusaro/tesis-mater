@@ -14,10 +14,23 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.core.cammesa_simulator import simulate_cammesa
+from src.core.compliance import (
+    cumple_maximo_cliente,
+    cumple_minimo_cliente,
+    cumple_top_generador,
+    cumple_top_por_faltante,
+    incumplimiento_sobre_tolerancia,
+)
 from src.core.optimizer_milp import solve_milp_nominal
 from src.io.exporter import results_to_excel_bytes
 from src.io.loader import load_excel
 from src.io.overrides import apply_nominal_overrides
+from src.viz.optimization import (
+    clientes_incumplidores,
+    grafico_variaciones_clientes,
+    precios_venta_ponderados,
+    variaciones_por_cliente,
+)
 
 
 st.set_page_config(page_title="Asignación de Energía - Demo", layout="wide")
@@ -202,7 +215,7 @@ def _client_minmax_table(df_lim: pd.DataFrame, results: dict[str, pd.DataFrame],
       - min_anual_mwh (si no existe en df_lim -> 0)
       - max_anual_mwh (si no existe -> NaN)
       - asignado_anual_mwh (desde results["detalle"])
-      - cumple_min (check)
+      - diferencias reales y clasificaciones contractuales anuales
     """
     lim = df_lim.copy()
     if "anio" in lim.columns:
@@ -213,7 +226,20 @@ def _client_minmax_table(df_lim: pd.DataFrame, results: dict[str, pd.DataFrame],
     c_max = _pick_first_col(lim, ["max_anual_mwh", "max_mwh_anual", "maximo_anual_mwh", "max_mwh"])
 
     if not c_cliente:
-        return pd.DataFrame(columns=["nemo_cliente", "min_anual_mwh", "max_anual_mwh", "asignado_anual_mwh", "cumple_min"])
+        return pd.DataFrame(
+            columns=[
+                "nemo_cliente",
+                "min_anual_mwh",
+                "max_anual_mwh",
+                "asignado_anual_mwh",
+                "faltante_min_mwh",
+                "faltante_min_incumplido_mwh",
+                "exceso_max_mwh",
+                "exceso_max_incumplido_mwh",
+                "cumple_min",
+                "cumple_max",
+            ]
+        )
 
     base = lim[[c_cliente]].drop_duplicates().rename(columns={c_cliente: "nemo_cliente"}).copy()
 
@@ -240,10 +266,64 @@ def _client_minmax_table(df_lim: pd.DataFrame, results: dict[str, pd.DataFrame],
         base = base.merge(asg, on="nemo_cliente", how="left")
         base["asignado_anual_mwh"] = pd.to_numeric(base["asignado_anual_mwh"], errors="coerce").fillna(0.0)
 
-    base["cumple_min"] = (base["asignado_anual_mwh"] >= base["min_anual_mwh"]).map({True: "✅", False: "❌"})
+    annual = results.get("clientes_anual", pd.DataFrame())
+    annual_fields = {
+        "nemo_cliente",
+        "cumple_min",
+        "cumple_max",
+        "faltante_min_mwh",
+        "faltante_min_incumplido_mwh",
+        "exceso_max_mwh",
+        "exceso_max_incumplido_mwh",
+    }
+    if not annual.empty and annual_fields.issubset(annual.columns):
+        client_status = annual.groupby("nemo_cliente", as_index=False).agg(
+            cumple_min=("cumple_min", "all"),
+            cumple_max=("cumple_max", "all"),
+            faltante_min_mwh=("faltante_min_mwh", "max"),
+            faltante_min_incumplido_mwh=("faltante_min_incumplido_mwh", "max"),
+            exceso_max_mwh=("exceso_max_mwh", "max"),
+            exceso_max_incumplido_mwh=("exceso_max_incumplido_mwh", "max"),
+        )
+        base = base.merge(client_status, on="nemo_cliente", how="left")
+    else:
+        base["faltante_min_mwh"] = (
+            base["min_anual_mwh"] - base["asignado_anual_mwh"]
+        ).clip(lower=0.0)
+        base["faltante_min_incumplido_mwh"] = incumplimiento_sobre_tolerancia(
+            base["faltante_min_mwh"]
+        )
+        base["exceso_max_mwh"] = (
+            base["asignado_anual_mwh"] - base["max_anual_mwh"]
+        ).clip(lower=0.0)
+        base["exceso_max_incumplido_mwh"] = incumplimiento_sobre_tolerancia(
+            base["exceso_max_mwh"]
+        )
+        max_contrato = base["max_anual_mwh"].where(base["max_anual_mwh"].notna(), np.inf)
+        base["cumple_min"] = cumple_minimo_cliente(
+            base["asignado_anual_mwh"], base["min_anual_mwh"]
+        )
+        base["cumple_max"] = cumple_maximo_cliente(
+            base["asignado_anual_mwh"], max_contrato
+        )
+    base["cumple_min"] = base["cumple_min"].map({True: "✅", False: "❌"})
+    base["cumple_max"] = base["cumple_max"].map({True: "✅", False: "❌"})
 
     return (
-        base[["nemo_cliente", "min_anual_mwh", "max_anual_mwh", "asignado_anual_mwh", "cumple_min"]]
+        base[
+            [
+                "nemo_cliente",
+                "min_anual_mwh",
+                "max_anual_mwh",
+                "asignado_anual_mwh",
+                "faltante_min_mwh",
+                "faltante_min_incumplido_mwh",
+                "exceso_max_mwh",
+                "exceso_max_incumplido_mwh",
+                "cumple_min",
+                "cumple_max",
+            ]
+        ]
         .sort_values("nemo_cliente")
         .reset_index(drop=True)
     )
@@ -683,6 +763,17 @@ def main() -> None:
                     top_anual["shortfall_anual_mwh"], errors="coerce"
                 ).fillna(0.0)
                 energia_top_incumplida = float(top_anual["shortfall_anual_mwh"].sum())
+                if "shortfall_incumplido_anual_mwh" not in top_anual.columns:
+                    top_anual["shortfall_incumplido_anual_mwh"] = incumplimiento_sobre_tolerancia(
+                        top_anual["shortfall_anual_mwh"]
+                    )
+                energia_top_considerada_incumplida = float(
+                    pd.to_numeric(top_anual["shortfall_incumplido_anual_mwh"], errors="coerce")
+                    .fillna(0.0)
+                    .sum()
+                )
+            else:
+                energia_top_considerada_incumplida = 0.0
 
             def _format_es(value: float) -> str:
                 return f"{value:,.0f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -694,7 +785,7 @@ def main() -> None:
             b1, b2, b3, b4 = st.columns(4)
             b1.metric("Energía total asignada (MWh)", f"{_format_es(energia_total_asignada)}")
             b2.metric("Energía no abastecida (MWh)", f"{_format_es(energia_no_abastecida)}")
-            b3.metric("Energía TOP (Incumplimiento) (MWh)", f"{_format_es(energia_top_incumplida)}")
+            b3.metric("Energía TOP real (faltante) (MWh)", f"{_format_es(energia_top_incumplida)}")
             with b4:
                 st.metric("Margen Bruto Operativo (USD)", f"{_format_es(margen_bruto_operativo)}")
                 st.caption("No contempla penalizaciones por incumplimientos TOP")
@@ -711,16 +802,31 @@ def main() -> None:
                 cliente_status["min_anual_mwh"] = pd.to_numeric(
                     cliente_status["min_anual_mwh"], errors="coerce"
                 ).fillna(0.0)
+                if "cumple_min" not in cliente_status.columns:
+                    cliente_status["cumple_min"] = cumple_minimo_cliente(
+                        cliente_status["energia_real_anual_mwh"], cliente_status["min_anual_mwh"]
+                    )
+                if "faltante_min_mwh" not in cliente_status.columns:
+                    cliente_status["faltante_min_mwh"] = (
+                        cliente_status["min_anual_mwh"] - cliente_status["energia_real_anual_mwh"]
+                    ).clip(lower=0.0)
+                if "faltante_min_incumplido_mwh" not in cliente_status.columns:
+                    cliente_status["faltante_min_incumplido_mwh"] = incumplimiento_sobre_tolerancia(
+                        cliente_status["faltante_min_mwh"]
+                    )
                 cliente_status = cliente_status.groupby("nemo_cliente", as_index=False).agg(
                     energia_real_anual_mwh=("energia_real_anual_mwh", "max"),
                     min_anual_mwh=("min_anual_mwh", "max"),
+                    cumple_min=("cumple_min", "all"),
+                    faltante_min_mwh=("faltante_min_mwh", "max"),
+                    faltante_min_incumplido_mwh=("faltante_min_incumplido_mwh", "max"),
                 )
-                cliente_status["faltante_min_mwh"] = (
-                    cliente_status["min_anual_mwh"] - cliente_status["energia_real_anual_mwh"]
-                ).clip(lower=0.0)
-                bajo_minimo = cliente_status[cliente_status["faltante_min_mwh"] > 1e-9]
+                bajo_minimo = cliente_status[~cliente_status["cumple_min"]]
                 cantidad_clientes_bajo_minimo = int(bajo_minimo["nemo_cliente"].nunique())
-                mwh_faltantes_minimo = float(bajo_minimo["faltante_min_mwh"].sum())
+                mwh_faltantes_minimo = float(bajo_minimo["faltante_min_incumplido_mwh"].sum())
+                mwh_faltantes_minimo_real = float(cliente_status["faltante_min_mwh"].sum())
+            else:
+                mwh_faltantes_minimo_real = 0.0
 
             cons_cm = _consumption_by_client_month(df_cons_y)
             alloc_cm = _alloc_by_client_month(results)
@@ -742,7 +848,16 @@ def main() -> None:
             nombres_generadores_bajo_top = []
             if not top_anual.empty and "shortfall_anual_mwh" in top_anual.columns and "nemo_generador" in top_anual.columns:
                 top_anual["nemo_generador"] = top_anual["nemo_generador"].astype(str)
-                incumplidos = top_anual[pd.to_numeric(top_anual["shortfall_anual_mwh"], errors="coerce").fillna(0.0) > 1e-9].copy()
+                if "cumple_top" not in top_anual.columns:
+                    if {"energia_tomada_anual_mwh", "min_take_anual_mwh"}.issubset(top_anual.columns):
+                        top_anual["cumple_top"] = cumple_top_generador(
+                            top_anual["energia_tomada_anual_mwh"], top_anual["min_take_anual_mwh"]
+                        )
+                    else:
+                        top_anual["cumple_top"] = cumple_top_por_faltante(
+                            top_anual["shortfall_anual_mwh"]
+                        )
+                incumplidos = top_anual[~top_anual["cumple_top"]].copy()
                 generadores_bajo_top = int(incumplidos["nemo_generador"].nunique())
 
                 names_by_generator = pd.DataFrame()
@@ -778,7 +893,10 @@ def main() -> None:
 
             with c2:
                 st.metric("Clientes bajo mínimo", f"{cantidad_clientes_bajo_minimo:,}")
-                st.caption(f"{_format_es(mwh_faltantes_minimo)} MWh faltantes para alcanzar mínimos")
+                st.caption(
+                    f"{_format_es(mwh_faltantes_minimo)} MWh de incumplimiento más allá de tolerancia; "
+                    f"faltante real: {_format_es(mwh_faltantes_minimo_real)} MWh"
+                )
 
             with c3:
                 st.metric("Clientes sobreasignados", f"{cantidad_clientes_sobreasignados:,}")
@@ -801,7 +919,8 @@ def main() -> None:
 
             st.markdown("**Penalidades TOP**")
             p1, p2, p3 = st.columns(3)
-            p1.metric("Energía TOP", f"{_format_es(energia_top_incumplida)} MWh")
+            p1.metric("Energía TOP sobre tolerancia", f"{_format_es(energia_top_considerada_incumplida)} MWh")
+            p1.caption(f"Faltante real TOP: {_format_es(energia_top_incumplida)} MWh")
 
             costo_unitario_texto = "No disponible"
             if not costos_unitarios_top.empty:
@@ -932,6 +1051,14 @@ def main() -> None:
                     if "nombre_hover_nombre" in top_chart.columns:
                         top_chart["nombre_hover"] = top_chart["nombre_hover_nombre"].fillna(top_chart["nombre_hover"])
 
+                if "cumple_top" not in top_chart.columns:
+                    top_chart["cumple_top"] = cumple_top_generador(
+                        top_chart["energia_tomada_anual_mwh"], top_chart["min_take_anual_mwh"]
+                    )
+                if "shortfall_incumplido_anual_mwh" not in top_chart.columns:
+                    top_chart["shortfall_incumplido_anual_mwh"] = incumplimiento_sobre_tolerancia(
+                        top_chart["min_take_anual_mwh"] - top_chart["energia_tomada_anual_mwh"]
+                    )
                 top_chart["Diferencia"] = (
                     pd.to_numeric(top_chart["energia_tomada_anual_mwh"], errors="coerce").fillna(0.0)
                     - pd.to_numeric(top_chart["min_take_anual_mwh"], errors="coerce").fillna(0.0)
@@ -977,11 +1104,23 @@ def main() -> None:
                 top_table["Energía mínima TOP"] = pd.to_numeric(top_table["min_take_anual_mwh"], errors="coerce").fillna(0.0).round(0).astype(int)
                 top_table["Energía asignada"] = pd.to_numeric(top_table["energia_tomada_anual_mwh"], errors="coerce").fillna(0.0).round(0).astype(int)
                 top_table["Diferencia"] = top_table["Diferencia"].round(0).astype(int)
-                top_table = top_table[["Generador", "Energía total disponible", "Energía mínima TOP", "Energía asignada", "Diferencia"]]
+                top_table["Incumplimiento > tolerancia (MWh)"] = top_table["shortfall_incumplido_anual_mwh"]
+                top_table["Cumple TOP"] = top_table["cumple_top"].map({True: "✅", False: "❌"})
+                top_table = top_table[
+                    [
+                        "Generador",
+                        "Energía total disponible",
+                        "Energía mínima TOP",
+                        "Energía asignada",
+                        "Diferencia",
+                        "Incumplimiento > tolerancia (MWh)",
+                        "Cumple TOP",
+                    ]
+                ]
                 st.dataframe(
                     _style_cells(top_table.style,
-                        lambda v: "color: #B91C1C; font-weight: 700" if isinstance(v, (int, float, np.integer, np.floating)) and v < 0 else "",
-                        subset=["Diferencia"],
+                        lambda v: "color: #B91C1C; font-weight: 700" if v == "❌" else "",
+                        subset=["Cumple TOP"],
                     ),
                     use_container_width=True,
                     hide_index=True,
@@ -994,12 +1133,37 @@ def main() -> None:
                 min_clientes = clientes_anual.copy()
                 min_clientes["energia_real_anual_mwh"] = pd.to_numeric(min_clientes["energia_real_anual_mwh"], errors="coerce").fillna(0.0)
                 min_clientes["min_anual_mwh"] = pd.to_numeric(min_clientes["min_anual_mwh"], errors="coerce").fillna(0.0)
+                if "cumple_min" not in min_clientes.columns:
+                    min_clientes["cumple_min"] = cumple_minimo_cliente(
+                        min_clientes["energia_real_anual_mwh"], min_clientes["min_anual_mwh"]
+                    )
+                if "faltante_min_mwh" not in min_clientes.columns:
+                    min_clientes["faltante_min_mwh"] = (
+                        min_clientes["min_anual_mwh"] - min_clientes["energia_real_anual_mwh"]
+                    ).clip(lower=0.0)
+                if "faltante_min_incumplido_mwh" not in min_clientes.columns:
+                    min_clientes["faltante_min_incumplido_mwh"] = incumplimiento_sobre_tolerancia(
+                        min_clientes["faltante_min_mwh"]
+                    )
                 min_clientes["Diferencia"] = min_clientes["energia_real_anual_mwh"] - min_clientes["min_anual_mwh"]
-                min_clientes = min_clientes[min_clientes["Diferencia"] < -1e-9].copy()
+                min_clientes = min_clientes[~min_clientes["cumple_min"]].copy()
                 if min_clientes.empty:
                     st.success("Cumplimiento total: ningún cliente está bajo su mínimo contractual anual.")
                 else:
-                    st.dataframe(min_clientes[["nemo_cliente", "min_anual_mwh", "energia_real_anual_mwh", "Diferencia"]], use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        min_clientes[
+                            [
+                                "nemo_cliente",
+                                "min_anual_mwh",
+                                "energia_real_anual_mwh",
+                                "Diferencia",
+                                "faltante_min_mwh",
+                                "faltante_min_incumplido_mwh",
+                            ]
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
             else:
                 st.info("No hay datos suficientes para verificar mínimos contractuales.")
 
@@ -1009,12 +1173,37 @@ def main() -> None:
                 max_clientes["max_anual_mwh"] = pd.to_numeric(max_clientes["max_anual_mwh"], errors="coerce")
                 max_clientes["energia_real_anual_mwh"] = pd.to_numeric(max_clientes["energia_real_anual_mwh"], errors="coerce").fillna(0.0)
                 max_clientes = max_clientes[max_clientes["max_anual_mwh"].notna()].copy()
+                if "cumple_max" not in max_clientes.columns:
+                    max_clientes["cumple_max"] = cumple_maximo_cliente(
+                        max_clientes["energia_real_anual_mwh"], max_clientes["max_anual_mwh"]
+                    )
+                if "exceso_max_mwh" not in max_clientes.columns:
+                    max_clientes["exceso_max_mwh"] = (
+                        max_clientes["energia_real_anual_mwh"] - max_clientes["max_anual_mwh"]
+                    ).clip(lower=0.0)
+                if "exceso_max_incumplido_mwh" not in max_clientes.columns:
+                    max_clientes["exceso_max_incumplido_mwh"] = incumplimiento_sobre_tolerancia(
+                        max_clientes["exceso_max_mwh"]
+                    )
                 max_clientes["Diferencia"] = max_clientes["energia_real_anual_mwh"] - max_clientes["max_anual_mwh"]
-                max_clientes = max_clientes[max_clientes["Diferencia"] > 1e-9].copy()
+                max_clientes = max_clientes[~max_clientes["cumple_max"]].copy()
                 if max_clientes.empty:
                     st.success("No existen sobreasignaciones frente al máximo contractual anual.")
                 else:
-                    st.dataframe(max_clientes[["nemo_cliente", "max_anual_mwh", "energia_real_anual_mwh", "Diferencia"]], use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        max_clientes[
+                            [
+                                "nemo_cliente",
+                                "max_anual_mwh",
+                                "energia_real_anual_mwh",
+                                "Diferencia",
+                                "exceso_max_mwh",
+                                "exceso_max_incumplido_mwh",
+                            ]
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
             else:
                 st.info("No hay datos suficientes para verificar máximos contractuales anuales.")
 
@@ -1038,6 +1227,7 @@ def main() -> None:
                 "resumen_mensual": results["resumen_mensual"],
                 "por_generador_pr": results["por_generador_prioridad"],
                 "detalle": results["detalle"],
+                "take_or_pay_anual": results.get("take_or_pay_anual", pd.DataFrame()),
                 "minmax_cliente": df_limits_b,
                 "gen_disp_vs_tom": df_gen_take_b,
                 "overassign": df_over_b,
@@ -1155,17 +1345,13 @@ def main() -> None:
             try:
                 sol = solve_milp_nominal(df_gen=df_gen_opt, df_cons=df_cons_opt, df_lim=df_lim, df_nom_template=df_nom_base, anio=int(anio), gen_scenario=None, cons_scenario=None, min_block_mwh_p2=float(min_block), fixed_penalty_p2_usd=float(pen), solver_time_limit_s=int(tlim))
                 results_opt = simulate_cammesa(df_gen_opt, df_cons_opt, df_lim, sol.df_nom_opt, anio=int(anio))
-                limits_opt = _client_minmax_table(df_lim, results_opt, int(anio))
-                violations_opt = _min_violations_table(limits_opt)
                 overassign_month_opt = _client_month_overassign(_consumption_by_client_month(df_cons_opt), _alloc_by_client_month(results_opt))
                 st.session_state["opt_solution"] = sol
                 st.session_state["opt_results"] = results_opt
                 st.session_state["opt_meta"] = {"anio": int(anio), "gen": gen_scen, "cons": cons_scen}
                 st.session_state["opt_gen_y"] = df_gen_opt
                 st.session_state["opt_cons_y"] = df_cons_opt
-                st.session_state["opt_limits"] = limits_opt
                 st.session_state["opt_overassign"] = overassign_month_opt
-                st.session_state["opt_min_viol"] = violations_opt
             except ModuleNotFoundError:
                 st.error("No está instalada la biblioteca 'pulp'. Instalá dependencias con: `pip install -r requirements.txt`")
                 st.stop()
@@ -1195,35 +1381,41 @@ def main() -> None:
                 clients = source.get("clientes_anual", pd.DataFrame())
                 unserved = source.get("no_abastecido", pd.DataFrame())
                 shortfall = pd.to_numeric(top.get("shortfall_anual_mwh", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
-                under_count = over_count = 0
-                if not clients.empty and {"nemo_cliente", "energia_real_anual_mwh", "min_anual_mwh"}.issubset(clients.columns):
-                    annual = clients.copy()
-                    for field in ["energia_real_anual_mwh", "min_anual_mwh"]:
-                        annual[field] = pd.to_numeric(annual[field], errors="coerce").fillna(0.0)
-                    group_fields = {"energia_real_anual_mwh": ("energia_real_anual_mwh", "max"), "min_anual_mwh": ("min_anual_mwh", "max")}
-                    if "max_anual_mwh" in annual.columns:
-                        annual["max_anual_mwh"] = pd.to_numeric(annual["max_anual_mwh"], errors="coerce")
-                        group_fields["max_anual_mwh"] = ("max_anual_mwh", "max")
-                    annual = annual.groupby("nemo_cliente", as_index=False).agg(**group_fields)
-                    under_count = int((annual["energia_real_anual_mwh"] < annual["min_anual_mwh"] - 1e-9).sum())
-                    if "max_anual_mwh" in annual.columns:
-                        finite = annual["max_anual_mwh"].notna() & annual["max_anual_mwh"].ne(float("inf"))
-                        over_count = int((finite & (annual["energia_real_anual_mwh"] > annual["max_anual_mwh"] + 1e-9)).sum())
+                shortfall_over_tolerance = pd.to_numeric(
+                    top.get(
+                        "shortfall_incumplido_anual_mwh",
+                        incumplimiento_sobre_tolerancia(shortfall),
+                    ),
+                    errors="coerce",
+                ).fillna(0.0)
+                if "cumple_top" not in top.columns and {
+                    "energia_tomada_anual_mwh",
+                    "min_take_anual_mwh",
+                }.issubset(top.columns):
+                    top = top.copy()
+                    top["cumple_top"] = cumple_top_generador(
+                        top["energia_tomada_anual_mwh"], top["min_take_anual_mwh"]
+                    )
+                elif "cumple_top" not in top.columns:
+                    top = top.copy()
+                    top["cumple_top"] = cumple_top_por_faltante(shortfall)
+                under_clients, over_clients = clientes_incumplidores(clients)
                 return {
                     "Energía asignada": float(pd.to_numeric(summary.get("energia_asignada_mwh", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()),
                     "Energía no abastecida": float(pd.to_numeric(unserved.get("no_abastecido_mwh", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()),
                     "Energía TOP": float(shortfall.sum()),
+                    "Energía TOP sobre tolerancia": float(shortfall_over_tolerance.sum()),
                     "Margen Bruto Operativo": float(pd.to_numeric(summary.get("margen_usd", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()),
                     "Penalidad TOP": float(pd.to_numeric(top.get("penalidad_anual_usd", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()),
-                    "Generadores bajo TOP": float((shortfall > 1e-9).sum()),
-                    "Clientes bajo mínimo": float(under_count),
-                    "Clientes sobre máximo anual": float(over_count),
+                    "Generadores bajo TOP": float((~top["cumple_top"]).sum()),
+                    "Clientes bajo mínimo": float(len(under_clients)),
+                    "Clientes sobre máximo anual": float(len(over_clients)),
                 }
 
             optimized = _optimization_metrics(opt_result)
             baseline = _optimization_metrics(baseline_result_opt) if comparable else {}
             st.caption("Diferencias respecto de Baseline con el mismo año y escenarios." if comparable else "Ejecutá Baseline con esta misma selección para habilitar las diferencias.")
-            metric_info = [("Energía asignada (MWh)", "Energía asignada", True), ("Energía no abastecida (MWh)", "Energía no abastecida", False), ("Energía TOP (MWh)", "Energía TOP", False), ("Margen Bruto Operativo (USD)", "Margen Bruto Operativo", True), ("Penalidad TOP (USD)", "Penalidad TOP", False), ("Generadores bajo TOP", "Generadores bajo TOP", False), ("Clientes bajo mínimo", "Clientes bajo mínimo", False), ("Clientes sobre máximo anual", "Clientes sobre máximo anual", False)]
+            metric_info = [("Energía asignada (MWh)", "Energía asignada", True), ("Energía no abastecida (MWh)", "Energía no abastecida", False), ("Energía TOP real (MWh)", "Energía TOP", False), ("TOP sobre tolerancia (MWh)", "Energía TOP sobre tolerancia", False), ("Margen Bruto Operativo (USD)", "Margen Bruto Operativo", True), ("Penalidad TOP (USD)", "Penalidad TOP", False), ("Generadores bajo TOP", "Generadores bajo TOP", False), ("Clientes bajo mínimo", "Clientes bajo mínimo", False), ("Clientes sobre máximo anual", "Clientes sobre máximo anual", False)]
             for offset in range(0, len(metric_info), 4):
                 metric_columns = st.columns(4)
                 for column, (label, key, good_up) in zip(metric_columns, metric_info[offset:offset + 4]):
@@ -1268,10 +1460,18 @@ def main() -> None:
             top_required = {"nemo_generador", "energia_disponible_anual_mwh", "min_take_anual_mwh", "energia_tomada_anual_mwh", "shortfall_anual_mwh"}
             if not top_result.empty and top_required.issubset(top_result.columns):
                 top_result["nemo_generador"] = top_result["nemo_generador"].astype(str)
+                if "cumple_top" not in top_result.columns:
+                    top_result["cumple_top"] = cumple_top_generador(
+                        top_result["energia_tomada_anual_mwh"], top_result["min_take_anual_mwh"]
+                    )
+                if "shortfall_incumplido_anual_mwh" not in top_result.columns:
+                    top_result["shortfall_incumplido_anual_mwh"] = incumplimiento_sobre_tolerancia(
+                        top_result["shortfall_anual_mwh"]
+                    )
                 top_result["Diferencia"] = pd.to_numeric(top_result["energia_tomada_anual_mwh"], errors="coerce").fillna(0.0) - pd.to_numeric(top_result["min_take_anual_mwh"], errors="coerce").fillna(0.0)
                 names_map = df_gen_opt.groupby("nemo_generador")["nombre_generador"].agg(lambda values: " / ".join(sorted(set(str(v) for v in values.dropna() if str(v).strip())))).to_dict() if "nombre_generador" in df_gen_opt.columns else {}
                 top_result["Generador"] = top_result["nemo_generador"].map(names_map).fillna(top_result["nemo_generador"])
-                top_failed = top_result[pd.to_numeric(top_result["shortfall_anual_mwh"], errors="coerce").fillna(0.0) > 1e-9].copy()
+                top_failed = top_result[~top_result["cumple_top"]].copy()
                 if top_failed.empty:
                     st.success("Cumplimiento total de TOP contractual")
                 else:
@@ -1283,53 +1483,76 @@ def main() -> None:
                     st.plotly_chart(top_fig, use_container_width=True)
                 top_table = top_result[["Generador", "energia_disponible_anual_mwh", "min_take_anual_mwh", "energia_tomada_anual_mwh", "Diferencia"]].copy()
                 top_table.columns = ["Generador", "Energía total disponible", "Energía mínima TOP", "Energía asignada", "Diferencia"]
+                top_table["Incumplimiento > tolerancia (MWh)"] = top_result["shortfall_incumplido_anual_mwh"]
+                top_table["Cumple TOP"] = top_result["cumple_top"].map({True: "✅", False: "❌"})
                 for col in top_table.columns[1:]:
-                    top_table[col] = pd.to_numeric(top_table[col], errors="coerce").fillna(0.0).round().astype(int)
-                st.dataframe(_style_cells(top_table.style, lambda value: "color:#B91C1C;font-weight:700" if isinstance(value, (int, float, np.integer, np.floating)) and value < 0 else "", subset=["Diferencia"]), use_container_width=True, hide_index=True)
+                    if col != "Cumple TOP":
+                        top_table[col] = pd.to_numeric(top_table[col], errors="coerce").fillna(0.0).round().astype(int)
+                st.dataframe(_style_cells(top_table.style, lambda value: "color:#B91C1C;font-weight:700" if value == "❌" else "", subset=["Cumple TOP"]), use_container_width=True, hide_index=True)
             else:
                 st.info("No hay datos suficientes en `take_or_pay_anual` para el análisis TOP.")
 
             opt_clients = opt_result.get("clientes_anual", pd.DataFrame()).copy()
             client_names_opt = df_cons_opt.groupby("nemo_cliente")["nombre_cliente"].agg(lambda values: " / ".join(sorted(set(str(v) for v in values.dropna() if str(v).strip())))).to_dict() if "nombre_cliente" in df_cons_opt.columns else {}
+            under_min_clients, annual_max_excess = clientes_incumplidores(opt_clients)
             st.markdown("### Clientes bajo mínimo contractual")
             if not opt_clients.empty and {"nemo_cliente", "energia_real_anual_mwh", "min_anual_mwh"}.issubset(opt_clients.columns):
-                for col in ["energia_real_anual_mwh", "min_anual_mwh"]:
-                    opt_clients[col] = pd.to_numeric(opt_clients[col], errors="coerce").fillna(0.0)
-                opt_clients["Diferencia"] = opt_clients["energia_real_anual_mwh"] - opt_clients["min_anual_mwh"]
-                opt_clients = opt_clients.groupby("nemo_cliente", as_index=False).agg(energia_real_anual_mwh=("energia_real_anual_mwh", "max"), min_anual_mwh=("min_anual_mwh", "max"), Diferencia=("Diferencia", "min"))
-                under_min_clients = opt_clients[opt_clients["Diferencia"] < -1e-9].sort_values("Diferencia")
                 if under_min_clients.empty:
-                    st.success("Cumplimiento total de los mínimos contractuales")
+                    st.markdown(
+                        '<div style="text-align:center;background:#e8f5e9;color:#176b3a;'
+                        'padding:1rem;border-radius:0.5rem;">'
+                        '✅ Todos los clientes cumplen el mínimo contractual</div>',
+                        unsafe_allow_html=True,
+                    )
                 else:
+                    under_min_clients["Diferencia"] = under_min_clients["energia_real_anual_mwh"] - under_min_clients["min_anual_mwh"]
+                    under_min_clients = under_min_clients.sort_values("Diferencia")
+                    if "faltante_min_mwh" not in under_min_clients:
+                        under_min_clients["faltante_min_mwh"] = (-under_min_clients["Diferencia"]).clip(lower=0.0)
+                    if "faltante_min_incumplido_mwh" not in under_min_clients:
+                        under_min_clients["faltante_min_incumplido_mwh"] = incumplimiento_sobre_tolerancia(under_min_clients["faltante_min_mwh"])
                     under_min_clients["Cliente"] = under_min_clients["nemo_cliente"].map(client_names_opt).fillna(under_min_clients["nemo_cliente"])
                     min_plot = under_min_clients.melt(id_vars=["Cliente", "nemo_cliente"], value_vars=["min_anual_mwh", "energia_real_anual_mwh"], var_name="Serie", value_name="MWh")
                     min_plot["Serie"] = min_plot["Serie"].map({"min_anual_mwh": "Mínimo contractual", "energia_real_anual_mwh": "Asignado"})
-                    min_fig = px.bar(min_plot, x="Cliente", y="MWh", color="Serie", barmode="group", custom_data=["nemo_cliente"], color_discrete_map={"Mínimo contractual": "#7DA5C4", "Asignado": "#B93A3A"}, category_orders={"Cliente": under_min_clients["Cliente"].tolist()})
-                    min_fig.update_traces(hovertemplate="%{x}<br>NEMO %{customdata[0]}<br>%{y:,.0f} MWh<extra></extra>")
+                    min_fig = px.bar(min_plot, x="nemo_cliente", y="MWh", color="Serie", barmode="group", custom_data=["Cliente"], color_discrete_map={"Mínimo contractual": "#7DA5C4", "Asignado": "#B93A3A"}, category_orders={"nemo_cliente": under_min_clients["nemo_cliente"].tolist()})
+                    min_fig.update_traces(hovertemplate="%{customdata[0]}<br>NEMO %{x}<br>%{y:,.0f} MWh<extra></extra>")
                     min_fig.update_layout(height=360, xaxis_title="Cliente", yaxis_title="Energía anual (MWh)", margin=dict(l=15, r=15, t=15, b=100))
-                    st.plotly_chart(min_fig, use_container_width=True)
+                    st.plotly_chart(min_fig, width="stretch", alt="Clientes que no cumplen el mínimo contractual anual")
                     min_table = under_min_clients.copy()
                     min_table["Cliente"] = min_table["nemo_cliente"].map(client_names_opt).fillna(min_table["nemo_cliente"])
-                    min_table = min_table.rename(columns={"min_anual_mwh": "Energía mínima comprometida", "energia_real_anual_mwh": "Energía asignada"})
-                    for col in ["Energía mínima comprometida", "Energía asignada", "Diferencia"]:
+                    min_table = min_table.rename(columns={"min_anual_mwh": "Energía mínima comprometida", "energia_real_anual_mwh": "Energía asignada", "faltante_min_mwh": "Faltante real", "faltante_min_incumplido_mwh": "Incumplimiento > tolerancia"})
+                    for col in ["Energía mínima comprometida", "Energía asignada", "Diferencia", "Faltante real", "Incumplimiento > tolerancia"]:
                         min_table[col] = min_table[col].round().astype(int)
-                    st.dataframe(_style_cells(min_table[["Cliente", "Energía mínima comprometida", "Energía asignada", "Diferencia"]].style, lambda value: "color:#B91C1C;font-weight:700" if isinstance(value, (int, float, np.integer, np.floating)) and value < 0 else "", subset=["Diferencia"]), use_container_width=True, hide_index=True)
+                    st.dataframe(_style_cells(min_table[["Cliente", "Energía mínima comprometida", "Energía asignada", "Diferencia", "Faltante real", "Incumplimiento > tolerancia"]].style, lambda value: "color:#B91C1C;font-weight:700" if isinstance(value, (int, float, np.integer, np.floating)) and value < 0 else "", subset=["Diferencia"]), use_container_width=True, hide_index=True)
+            else:
+                st.info("No hay datos suficientes para verificar mínimos contractuales.")
 
             st.markdown("### Clientes sobreasignados frente al máximo contractual anual")
             if not opt_clients.empty and "max_anual_mwh" in opt_clients.columns:
-                opt_clients["max_anual_mwh"] = pd.to_numeric(opt_clients["max_anual_mwh"], errors="coerce")
-                annual_max_excess = opt_clients[opt_clients["max_anual_mwh"].notna() & opt_clients["max_anual_mwh"].ne(float("inf"))].copy()
-                annual_max_excess["Diferencia"] = annual_max_excess["energia_real_anual_mwh"] - annual_max_excess["max_anual_mwh"]
-                annual_max_excess = annual_max_excess[annual_max_excess["Diferencia"] > 1e-9].copy()
-                st.metric("Clientes sobre máximo anual", f"{annual_max_excess['nemo_cliente'].nunique():,}")
                 if annual_max_excess.empty:
-                    st.success("Cumplimiento total de las restricciones de máximo")
+                    st.markdown(
+                        '<div style="text-align:center;background:#e8f5e9;color:#176b3a;'
+                        'padding:1rem;border-radius:0.5rem;">'
+                        '✅ Ningún cliente excedió su máximo contractual</div>',
+                        unsafe_allow_html=True,
+                    )
                 else:
+                    annual_max_excess["Diferencia"] = annual_max_excess["energia_real_anual_mwh"] - annual_max_excess["max_anual_mwh"]
+                    if "exceso_max_mwh" not in annual_max_excess:
+                        annual_max_excess["exceso_max_mwh"] = annual_max_excess["Diferencia"].clip(lower=0.0)
+                    if "exceso_max_incumplido_mwh" not in annual_max_excess:
+                        annual_max_excess["exceso_max_incumplido_mwh"] = incumplimiento_sobre_tolerancia(annual_max_excess["exceso_max_mwh"])
                     annual_max_excess["Cliente"] = annual_max_excess["nemo_cliente"].map(client_names_opt).fillna(annual_max_excess["nemo_cliente"])
-                    annual_max_excess = annual_max_excess.rename(columns={"max_anual_mwh": "Energía máxima acordada", "energia_real_anual_mwh": "Energía asignada"})
-                    for col in ["Energía máxima acordada", "Energía asignada", "Diferencia"]:
+                    max_plot = annual_max_excess.melt(id_vars=["Cliente", "nemo_cliente"], value_vars=["max_anual_mwh", "energia_real_anual_mwh"], var_name="Serie", value_name="MWh")
+                    max_plot["Serie"] = max_plot["Serie"].map({"max_anual_mwh": "Máximo contractual", "energia_real_anual_mwh": "Asignado"})
+                    max_fig = px.bar(max_plot, x="nemo_cliente", y="MWh", color="Serie", barmode="group", custom_data=["Cliente"], color_discrete_map={"Máximo contractual": "#7DA5C4", "Asignado": "#B93A3A"})
+                    max_fig.update_traces(hovertemplate="%{customdata[0]}<br>NEMO %{x}<br>%{y:,.0f} MWh<extra></extra>")
+                    max_fig.update_layout(height=360, xaxis_title="Cliente", yaxis_title="Energía anual (MWh)", margin=dict(l=15, r=15, t=15, b=100))
+                    st.plotly_chart(max_fig, width="stretch", alt="Clientes que superan su máximo contractual anual")
+                    annual_max_excess = annual_max_excess.rename(columns={"max_anual_mwh": "Energía máxima acordada", "energia_real_anual_mwh": "Energía asignada", "exceso_max_mwh": "Exceso real", "exceso_max_incumplido_mwh": "Incumplimiento > tolerancia"})
+                    for col in ["Energía máxima acordada", "Energía asignada", "Diferencia", "Exceso real", "Incumplimiento > tolerancia"]:
                         annual_max_excess[col] = annual_max_excess[col].round().astype(int)
-                    st.dataframe(annual_max_excess[["Cliente", "Energía máxima acordada", "Energía asignada", "Diferencia"]], use_container_width=True, hide_index=True)
+                    st.dataframe(annual_max_excess[["Cliente", "Energía máxima acordada", "Energía asignada", "Diferencia", "Exceso real", "Incumplimiento > tolerancia"]], use_container_width=True, hide_index=True)
             else:
                 st.info("No hay datos suficientes para verificar máximos contractuales anuales.")
 
@@ -1343,10 +1566,23 @@ def main() -> None:
                     annual_comparison = base_clients.merge(opt_clients_compare, on="nemo_cliente", how="outer").fillna(0.0)
                     annual_comparison["Diferencia (MWh)"] = annual_comparison["Optimización (MWh)"] - annual_comparison["Baseline (MWh)"]
                     annual_comparison["Cliente"] = annual_comparison["nemo_cliente"].map(client_names_opt).fillna(annual_comparison["nemo_cliente"])
+                    changes = variaciones_por_cliente(annual_comparison)
+                    comparison_display = annual_comparison[["Cliente", "Baseline (MWh)", "Optimización (MWh)", "Diferencia (MWh)"]].copy()
                     for col in ["Baseline (MWh)", "Optimización (MWh)", "Diferencia (MWh)"]:
-                        annual_comparison[col] = annual_comparison[col].round().astype(int)
-                    comparison_display = annual_comparison[["Cliente", "Baseline (MWh)", "Optimización (MWh)", "Diferencia (MWh)"]]
+                        comparison_display[col] = comparison_display[col].round().astype(int)
                     st.dataframe(_style_cells(comparison_display.style, lambda value: "color:#137333;font-weight:700" if isinstance(value, (int, float, np.integer, np.floating)) and value > 0 else ("color:#B91C1C;font-weight:700" if isinstance(value, (int, float, np.integer, np.floating)) and value < 0 else ""), subset=["Diferencia (MWh)"]), use_container_width=True, hide_index=True)
+                    if not changes.empty:
+                        prices = precios_venta_ponderados(opt_result.get("detalle", pd.DataFrame()))
+                        changes = changes.merge(prices, on="nemo_cliente", how="left", sort=False)
+                        st.plotly_chart(
+                            grafico_variaciones_clientes(changes),
+                            width="stretch",
+                            alt="Variación anual y precio de venta ponderado por cliente",
+                        )
+                        if changes["precio_venta_ponderado_usd_mwh"].isna().any():
+                            st.caption("El precio no está disponible para clientes sin energía asignada en Optimización; sus barras se conservan.")
+                        if changes["precio_venta_ponderado_usd_mwh"].notna().sum() < 2:
+                            st.caption("Se necesitan al menos dos precios disponibles para mostrar la tendencia.")
             else:
                 st.info("La comparación por cliente requiere Baseline con el mismo año y escenarios.")
 
@@ -1354,8 +1590,8 @@ def main() -> None:
             if not monthly_over_opt.empty:
                 st.caption(f"Sobreasignación mensual respecto al consumo: {monthly_over_opt['nemo_cliente'].nunique():,} clientes; es un criterio distinto del máximo contractual anual.")
 
-            df_limits_o = st.session_state.get("opt_limits", _client_minmax_table(df_lim, opt_result, int(anio)))
-            df_min_viol = st.session_state.get("opt_min_viol", _min_violations_table(df_limits_o))
+            df_limits_o = _client_minmax_table(df_lim, opt_result, int(anio))
+            df_min_viol = _min_violations_table(df_limits_o)
             df_over_o = st.session_state.get("opt_overassign", monthly_over_opt)
             econ_o = _annual_economics(opt_result)
             df_econ_o = pd.DataFrame([econ_o]).T.reset_index()
@@ -1373,7 +1609,7 @@ def main() -> None:
                 st.dataframe(df_gen_take_o, use_container_width=True, hide_index=True)
                 st.dataframe(df_over_o, use_container_width=True, hide_index=True)
                 st.dataframe(df_econ_o, use_container_width=True, hide_index=True)
-            xlsx_all_o = _dfs_to_excel_bytes({"economia_anual": df_econ_o, "resumen_mensual": opt_result["resumen_mensual"], "por_generador_pr": opt_result["por_generador_prioridad"], "detalle": opt_result["detalle"], "minmax_cliente": df_limits_o, "gen_disp_vs_tom": df_gen_take_o, "overassign": df_over_o, "min_viol": df_min_viol})
+            xlsx_all_o = _dfs_to_excel_bytes({"economia_anual": df_econ_o, "resumen_mensual": opt_result["resumen_mensual"], "por_generador_pr": opt_result["por_generador_prioridad"], "detalle": opt_result["detalle"], "take_or_pay_anual": opt_result.get("take_or_pay_anual", pd.DataFrame()), "minmax_cliente": df_limits_o, "gen_disp_vs_tom": df_gen_take_o, "overassign": df_over_o, "min_viol": df_min_viol})
             st.download_button("Descargar TODO OPT (Excel)", data=xlsx_all_o, file_name=f"opt_todo_{anio}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             st.download_button("Descargar resultados OPT (Excel - formato estándar)", data=results_to_excel_bytes(opt_result), file_name=f"resultados_opt_{anio}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
@@ -1429,7 +1665,7 @@ def main() -> None:
         st.markdown("### Tabla: Generador-Mes (Disponible + Base + Opt + Delta)")
         st.dataframe(df_gens[["nemo_generador", "mes", "disponible_mwh", "tomado_baseline_mwh", "tomado_opt_mwh", "delta_tomado_mwh"]], use_container_width=True, hide_index=True)
 
-        df_min_viol_opt = st.session_state.get("opt_min_viol", pd.DataFrame())
+        df_min_viol_opt = _min_violations_table(_client_minmax_table(df_lim, o, int(anio)))
         if not df_min_viol_opt.empty:
             st.divider()
             st.error("### Incumplimientos de mínimo (OPT)")

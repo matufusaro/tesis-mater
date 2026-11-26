@@ -3,6 +3,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from src.core.compliance import (
+    cumple_maximo_cliente,
+    cumple_minimo_cliente,
+    cumple_top_generador,
+    incumplimiento_sobre_tolerancia,
+)
+
 EPS = 1e-9
 
 
@@ -227,8 +234,24 @@ def simulate_cammesa(
     clientes_anual["min_anual_mwh"] = pd.to_numeric(clientes_anual["min_anual_mwh"], errors="coerce").fillna(0.0)
     clientes_anual["max_anual_mwh"] = pd.to_numeric(clientes_anual["max_anual_mwh"], errors="coerce").where(pd.notna(clientes_anual["max_anual_mwh"]), np.inf)
 
-    clientes_anual["cumple_min"] = clientes_anual["energia_real_anual_mwh"].astype(float) >= clientes_anual["min_anual_mwh"].astype(float) - 1e-6
-    clientes_anual["cumple_max"] = clientes_anual["energia_real_anual_mwh"].astype(float) <= clientes_anual["max_anual_mwh"].astype(float) + 1e-6
+    clientes_anual["faltante_min_mwh"] = (
+        clientes_anual["min_anual_mwh"] - clientes_anual["energia_real_anual_mwh"]
+    ).clip(lower=0.0)
+    clientes_anual["faltante_min_incumplido_mwh"] = incumplimiento_sobre_tolerancia(
+        clientes_anual["faltante_min_mwh"]
+    )
+    clientes_anual["exceso_max_mwh"] = (
+        clientes_anual["energia_real_anual_mwh"] - clientes_anual["max_anual_mwh"]
+    ).clip(lower=0.0)
+    clientes_anual["exceso_max_incumplido_mwh"] = incumplimiento_sobre_tolerancia(
+        clientes_anual["exceso_max_mwh"]
+    )
+    clientes_anual["cumple_min"] = cumple_minimo_cliente(
+        clientes_anual["energia_real_anual_mwh"], clientes_anual["min_anual_mwh"]
+    )
+    clientes_anual["cumple_max"] = cumple_maximo_cliente(
+        clientes_anual["energia_real_anual_mwh"], clientes_anual["max_anual_mwh"]
+    )
 
     # -------------------- TOP ANUAL --------------------
     if not df_gen_y.empty:
@@ -254,6 +277,12 @@ def simulate_cammesa(
         top_anual["energia_tomada_anual_mwh"] = pd.to_numeric(top_anual["energia_tomada_anual_mwh"], errors="coerce").fillna(0.0)
         top_anual["min_take_anual_mwh"] = top_anual["take_or_pay_ratio"].astype(float) * top_anual["energia_disponible_anual_mwh"].astype(float)
         top_anual["shortfall_anual_mwh"] = np.maximum(0.0, top_anual["min_take_anual_mwh"].astype(float) - top_anual["energia_tomada_anual_mwh"].astype(float))
+        top_anual["shortfall_incumplido_anual_mwh"] = incumplimiento_sobre_tolerancia(
+            top_anual["shortfall_anual_mwh"]
+        )
+        top_anual["cumple_top"] = cumple_top_generador(
+            top_anual["energia_tomada_anual_mwh"], top_anual["min_take_anual_mwh"]
+        )
         top_anual["penalidad_anual_usd"] = top_anual["shortfall_anual_mwh"].astype(float) * top_anual["penalidad_no_tomado_usd_mwh"].astype(float)
 
         penalidad_total = float(top_anual["penalidad_anual_usd"].sum())
